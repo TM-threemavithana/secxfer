@@ -64,10 +64,11 @@ from secxfer.crypto import (
     SecretstreamPusher,
     SignatureError,
     derive_stream_key,
+    generate_ephemeral_keypair,
     sign_digest,
     verify_digest,
 )
-from secxfer.keystore import Keystore, LocalIdentity, UnknownSenderError
+from secxfer.keystore import Keystore, LocalIdentity, UnknownSenderError, consume_prekey
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,13 @@ from secxfer.keystore import Keystore, LocalIdentity, UnknownSenderError
 # ---------------------------------------------------------------------------
 
 class ProtocolError(Exception):
-    """Base class for all transfer-layer protocol errors."""
+    """Base exception for all protocol-level transfer errors."""
+    pass
+
+
+class PreKeyConsumedError(ProtocolError):
+    """Raised when attempting to consume a pre-key that is missing or already burned."""
+    pass
 
 
 class VersionError(ProtocolError):
@@ -98,11 +105,11 @@ class TruncationError(ProtocolError):
 # Wire format constants
 # ---------------------------------------------------------------------------
 
-_PROTOCOL_VERSION: int = 0x01
+_PROTOCOL_VERSION: int = 0x02
 
-# Preamble: version(B=1) + key_id(8s) + stream_salt(24s) + stream_header(24s)
-_PREAMBLE_FMT: str = ">B8s24s24s"
-_PREAMBLE_SIZE: int = struct.calcsize(_PREAMBLE_FMT)   # 57 bytes
+# Preamble: version(B) + sender_key(8s) + prekey_id(16s) + ephemeral(32s) + sig(64s) + salt(24s) + header(24s)
+_PREAMBLE_FMT: str = ">B8s16s32s64s24s24s"
+_PREAMBLE_SIZE: int = struct.calcsize(_PREAMBLE_FMT)   # 169 bytes
 
 _CHUNK_LEN_FMT: str = ">I"                             # uint32 big-endian
 _CHUNK_LEN_SIZE: int = 4
@@ -284,7 +291,9 @@ class NonceCache:
 
 def send_file(
     identity: LocalIdentity,
-    receiver_pubkey_x25519: bytes,
+    receiver_key_id: bytes,
+    receiver_prekey_id: str,
+    receiver_prekey_pubkey: bytes,
     file_path: Path | str,
     out: BinaryIO,
     ttl_seconds: int = 300,
@@ -309,7 +318,9 @@ def send_file(
         ⑨ Push trailer chunk (TAG_FINAL): 64-byte Ed25519 signature
     Args:
         identity:               Sender's ``LocalIdentity`` (from keystore).
-        receiver_pubkey_x25519: Receiver's 32-byte Curve25519 public key.
+        receiver_key_id:        Receiver's 8-byte key ID.
+        receiver_prekey_id:     16-char hex string of the receiver's pre-key ID.
+        receiver_prekey_pubkey: Receiver's 32-byte Curve25519 pre-key public key.
         file_path:              Path to the plaintext file.
         out:                    Writable binary stream.
         ttl_seconds:            TTL embedded in the metadata header.
@@ -323,20 +334,29 @@ def send_file(
     # ③ Stream salt (must exist before key derivation) -----------------------
     stream_salt = os.urandom(24)
 
-    # ④ Derive stream key ----------------------------------------------------
+    # ④ Generate Ephemeral Key and Derive stream key -----------------------
+    ephemeral_priv, ephemeral_pub = generate_ephemeral_keypair()
     stream_key = derive_stream_key(
-        identity.x25519_privkey, receiver_pubkey_x25519, stream_salt
+        ephemeral_priv, receiver_prekey_pubkey, stream_salt
     )
 
     # ⑤ Init secretstream; stream_header is generated internally by init_push
     pusher = SecretstreamPusher(stream_key)
 
-    # ⑥ Write preamble -------------------------------------------------------
+    # ⑥ Write preamble (with Context-Bound Signature) -----------------------
+    prekey_id_bytes = receiver_prekey_id.encode('ascii')
+    transcript = ephemeral_pub + receiver_key_id + prekey_id_bytes
+    transcript_digest = hashlib.sha256(transcript).digest()
+    sig = sign_digest(identity.ed25519_seed, transcript_digest)
+
     out.write(
         struct.pack(
             _PREAMBLE_FMT,
             _PROTOCOL_VERSION,
             identity.key_id,
+            prekey_id_bytes,
+            ephemeral_pub,
+            sig,
             stream_salt,
             pusher.header,
         )
@@ -369,12 +389,11 @@ def send_file(
 
 
 # ---------------------------------------------------------------------------
-# Receiver
-# ---------------------------------------------------------------------------
-
 def receive_file(
     identity: LocalIdentity,
     keystore: Keystore,
+    keystore_dir: Path | str,
+    identity_name: str,
     inp: BinaryIO,
     dest_path: Path | str,
     nonce_cache: NonceCache,
@@ -426,7 +445,7 @@ def receive_file(
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
-    version, sender_key_id, stream_salt, stream_header = struct.unpack(
+    version, sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header = struct.unpack(
         _PREAMBLE_FMT, raw_preamble
     )
 
@@ -439,13 +458,28 @@ def receive_file(
     # Raises UnknownSenderError if not found
     peer = keystore.get(sender_key_id)
 
-    # ② Derive stream key and init puller ------------------------------------
+    # ② Verify Sender Authentication over Context-Bound Transcript -----------
+    transcript = ephemeral_pub + identity.key_id + prekey_id_bytes
+    transcript_digest = hashlib.sha256(transcript).digest()
+    try:
+        verify_digest(peer.ed25519, sig, transcript_digest)
+    except SignatureError as exc:
+        raise ProtocolError("Sender authentication failed (invalid signature or context mismatch)") from exc
+
+    # ③ Atomically Consume Pre-Key -------------------------------------------
+    prekey_id = prekey_id_bytes.decode('ascii')
+    try:
+        prekey_priv = consume_prekey(keystore_dir, identity_name, prekey_id)
+    except FileNotFoundError:
+        raise PreKeyConsumedError(f"Pre-Key {prekey_id} does not exist or was already consumed")
+
+    # ④ Derive stream key and init puller ------------------------------------
     stream_key = derive_stream_key(
-        identity.x25519_privkey, peer.x25519, stream_salt
+        prekey_priv, ephemeral_pub, stream_salt
     )
     puller = SecretstreamPuller(stream_key, stream_header)
 
-    # ③ Pull metadata chunk (chunk 0) ----------------------------------------
+    # ⑤ Pull metadata chunk (chunk 0) ----------------------------------------
     try:
         raw_meta_ct = _read_chunk(inp)
         meta_plaintext, is_final = puller.pull(raw_meta_ct)
@@ -460,7 +494,7 @@ def receive_file(
     timestamp: int = meta["timestamp"]
     ttl: int = meta["ttl"]
 
-    # ④ TTL check (stateless — no cache mutation on failure) -----------------
+    # ⑥ TTL check (stateless — no cache mutation on failure) -----------------
     now = time.time()
     if now - timestamp > ttl:
         raise TTLError(
@@ -468,10 +502,10 @@ def receive_file(
             f"age={int(now - timestamp)}s"
         )
 
-    # ⑤ Atomic nonce cache check-and-insert ---------------------------------
+    # ⑦ Atomic nonce cache check-and-insert ---------------------------------
     nonce_cache.check_and_insert(sender_key_id, transfer_nonce, ttl)
 
-    # ⑥ Open .part file for writing ------------------------------------------
+    # ⑧ Open .part file for writing ------------------------------------------
     def _cleanup() -> None:
         """Delete .part file if it exists; best-effort."""
         try:
@@ -482,7 +516,7 @@ def receive_file(
     try:
         with part_path.open("wb") as part_f:
 
-            # ⑦ Pull data chunks → write to .part ----------------------------
+            # ⑨ Pull data chunks → write to .part ----------------------------
             got_final = False
             sig = b""
             h = hashlib.sha256()
@@ -514,7 +548,7 @@ def receive_file(
             _cleanup()
             raise TruncationError("Stream ended without TAG_FINAL")
 
-        # ⑧ Verify Ed25519 signature over SHA-256(plaintext) -----------------
+        # ⑩ Verify Ed25519 signature over SHA-256(plaintext) -----------------
         try:
             verify_digest(peer.ed25519, sig, h.digest())
         except SignatureError:

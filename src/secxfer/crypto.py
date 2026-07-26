@@ -28,6 +28,7 @@ header-placement decision; deferred to a future version.
 from __future__ import annotations
 
 import hashlib
+import os
 import hmac as _hmac
 from typing import BinaryIO
 
@@ -116,6 +117,15 @@ def derive_stream_key(
         info=b"secxfer-v1-stream",
         length=STREAM_KEY_SIZE,
     )
+
+def generate_ephemeral_keypair() -> tuple[bytes, bytes]:
+    """
+    Generate a fresh Curve25519 keypair.
+    Returns (private_key, public_key), both 32 bytes.
+    """
+    priv = os.urandom(32)
+    pub = _nb.crypto_scalarmult_base(priv)
+    return priv, pub
 
 
 

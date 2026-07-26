@@ -164,7 +164,7 @@ class Keystore:
 # Key generation
 # ---------------------------------------------------------------------------
 
-def generate_keypair(output_dir: Path | str, name: str = "identity") -> LocalIdentity:
+def generate_keypair(output_dir: Path | str, name: str = "identity", num_prekeys: int = 50) -> LocalIdentity:
     """
     Generate a fresh Curve25519 + Ed25519 keypair and write it to disk.
 
@@ -213,6 +213,20 @@ def generate_keypair(output_dir: Path | str, name: str = "identity") -> LocalIde
     pub_path.write_bytes(x25519_pub + ed25519_pub)
 
     kid = key_id_from_x25519_pubkey(x25519_pub)
+
+    # Generate Ephemeral Pre-Keys
+    prekeys_dir = out / f"{name}_prekeys"
+    prekeys_dir.mkdir(parents=True, exist_ok=True)
+    for _ in range(num_prekeys):
+        pk_id = os.urandom(8).hex()
+        pk_priv = os.urandom(32)
+        pk_path = prekeys_dir / f"{pk_id}.key"
+        pk_path.write_bytes(pk_priv)
+        try:
+            pk_path.chmod(0o600)
+        except NotImplementedError:
+            pass
+
     return LocalIdentity(
         x25519_privkey=x25519_priv,
         ed25519_seed=ed25519_seed,
@@ -220,6 +234,39 @@ def generate_keypair(output_dir: Path | str, name: str = "identity") -> LocalIde
         ed25519_pubkey=ed25519_pub,
         key_id=kid,
     )
+
+def get_unused_prekeys(output_dir: Path | str, name: str = "identity") -> list[dict]:
+    """Returns a list of unused pre-keys for upload to the server."""
+    prekeys_dir = Path(output_dir) / f"{name}_prekeys"
+    if not prekeys_dir.exists():
+        return []
+    
+    prekeys = []
+    for pk_file in prekeys_dir.glob("*.key"):
+        pk_id = pk_file.stem
+        pk_priv = pk_file.read_bytes()
+        pk_pub = _nb.crypto_scalarmult_base(pk_priv)
+        prekeys.append({"id": pk_id, "pubkey": pk_pub.hex()})
+    return prekeys
+
+def consume_prekey(output_dir: Path | str, name: str, prekey_id: str) -> bytes:
+    """
+    Atomically consumes a pre-key.
+    Uses os.rename to ensure thread/process safe check-and-delete.
+    Returns the 32-byte private key.
+    Raises FileNotFoundError if the pre-key does not exist or was already consumed.
+    """
+    prekeys_dir = Path(output_dir) / f"{name}_prekeys"
+    pk_path = prekeys_dir / f"{prekey_id}.key"
+    consumed_path = prekeys_dir / f"{prekey_id}.key.used"
+    
+    # Atomic TOCTOU-safe consumption
+    os.rename(pk_path, consumed_path)
+    
+    pk_priv = consumed_path.read_bytes()
+    # Securely delete after reading
+    os.remove(consumed_path)
+    return pk_priv
 
 
 def load_identity(key_file: Path | str) -> LocalIdentity:

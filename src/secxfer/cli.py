@@ -8,8 +8,10 @@ I/O plumbing, and user-facing error messages.
 Commands
 --------
   secxfer keygen   --dir DIR [--name NAME]
-  secxfer send     FILE --identity KEY --to PUBKEY [--ttl SECS] [--out FILE]
-  secxfer receive  DEST --identity KEY --keystore DIR [--in FILE]
+  secxfer register --identity KEY --name NAME --server URL
+  secxfer pin      --name NAME --server URL --keystore DIR
+  secxfer send     FILE --identity KEY --to NAME --server URL --keystore DIR [--ttl SECS] [--out FILE]
+  secxfer receive  DEST --identity KEY --name NAME --keystore DIR [--in FILE]
   secxfer show-id  --identity KEY
 
 Transport model
@@ -17,13 +19,8 @@ Transport model
 send writes to stdout (or --out FILE); receive reads from stdin (or --in FILE).
 This makes the tool composable with standard Unix plumbing::
 
-    secxfer send secret.txt --identity alice.key --to bob.pub | \\
-        secxfer receive out.txt --identity bob.key --keystore ./keys
-
-Or via a file::
-
-    secxfer send secret.txt --identity alice.key --to bob.pub --out transfer.bin
-    secxfer receive out.txt --identity bob.key --keystore ./keys --in transfer.bin
+    secxfer send secret.txt --identity alice.key --to bob --server http://localhost:8000 --keystore ./keys | \
+        secxfer receive out.txt --identity bob.key --name bob --keystore ./keys
 
 Nonce cache lifetime
 --------------------
@@ -125,17 +122,90 @@ def _cmd_show_id(args: argparse.Namespace) -> None:
     print(f"Ed25519 : {identity.ed25519_pubkey.hex()}")
 
 
+def _cmd_register(args: argparse.Namespace) -> None:
+    import urllib.request
+    import json
+    from secxfer.keystore import get_unused_prekeys
+    
+    identity = load_identity(Path(args.identity))
+    prekeys = get_unused_prekeys(Path(args.identity).parent, args.name)
+    if not prekeys:
+        print("No unused pre-keys found. Generate with keygen.", file=sys.stderr)
+        return
+    
+    full_pubkey = identity.x25519_pubkey + identity.ed25519_pubkey
+    payload = {
+        "name": args.name,
+        "identity_pubkey": full_pubkey.hex(),
+        "prekeys": prekeys
+    }
+    req = urllib.request.Request(
+        args.server + "/register", 
+        data=json.dumps(payload).encode(), 
+        headers={'Content-Type': 'application/json'}
+    )
+    try:
+        with urllib.request.urlopen(req) as response:
+            print(f"Registered successfully: {response.read().decode()}")
+    except Exception as exc:
+        print(f"Registration failed: {exc}", file=sys.stderr)
+
+
+def _cmd_pin(args: argparse.Namespace) -> None:
+    import urllib.request
+    import json
+    req = urllib.request.Request(args.server + "/keys/" + args.name)
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+    except Exception as exc:
+        print(f"Failed to fetch key for {args.name}: {exc}", file=sys.stderr)
+        return
+
+    ident_hex = data["identity_pubkey"]
+    print(f"Server provided identity key for {args.name}: {ident_hex}")
+    ans = input("Trust this fingerprint? [y/N]: ")
+    if ans.strip().lower() == 'y':
+        keystore_dir = Path(args.keystore)
+        keystore_dir.mkdir(parents=True, exist_ok=True)
+        pub_path = keystore_dir / f"{args.name}.pub"
+        pub_path.write_bytes(bytes.fromhex(ident_hex))
+        print(f"Pinned {args.name} in {pub_path}")
+    else:
+        print("Pinning aborted.")
+
+
 def _cmd_send(args: argparse.Namespace) -> None:
+    import urllib.request
+    import json
+    from secxfer.keystore import key_id_from_x25519_pubkey
+
     """Encrypt and send a file to stdout (or --out FILE)."""
     identity = load_identity(Path(args.identity))
+    keystore = Keystore.from_directory(Path(args.keystore))
 
-    # Load receiver's public key from their .pub file
-    raw = Path(args.to).read_bytes()
-    if len(raw) != 64:
-        raise ProtocolError(
-            f"{args.to} is not a valid .pub file (expected 64 bytes, got {len(raw)})"
-        )
-    receiver_x25519_pubkey = raw[:32]  # first 32 bytes are the X25519 key
+    # Fetch prekey from server
+    req = urllib.request.Request(args.server + "/keys/" + args.to)
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+    except Exception as exc:
+        raise ProtocolError(f"Failed to fetch keys for {args.to} from server: {exc}")
+
+    server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+    
+    # Bidirectional TOFU Check!
+    receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
+    try:
+        pinned_peer = keystore.get(receiver_key_id)
+    except UnknownSenderError:
+        raise ProtocolError(f"Receiver {args.to} is not pinned! Run 'secxfer pin' first.")
+    
+    if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+        raise ProtocolError(f"CRITICAL: Server returned a different identity key for {args.to} than your pinned version! MITM attack detected.")
+
+    receiver_prekey_id = data["prekey"]["id"]
+    receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
 
     file_path = Path(args.file)
     if not file_path.exists():
@@ -146,7 +216,9 @@ def _cmd_send(args: argparse.Namespace) -> None:
         with out_path.open("wb") as out_f:
             send_file(
                 identity,
-                receiver_x25519_pubkey,
+                receiver_key_id,
+                receiver_prekey_id,
+                receiver_prekey_pubkey,
                 file_path,
                 out_f,
                 ttl_seconds=args.ttl,
@@ -157,7 +229,9 @@ def _cmd_send(args: argparse.Namespace) -> None:
         out_stream = sys.stdout.buffer
         send_file(
             identity,
-            receiver_x25519_pubkey,
+            receiver_key_id,
+            receiver_prekey_id,
+            receiver_prekey_pubkey,
             file_path,
             out_stream,
             ttl_seconds=args.ttl,
@@ -182,10 +256,10 @@ def _cmd_receive(args: argparse.Namespace) -> None:
     if args.input:
         inp_path = Path(args.input)
         with inp_path.open("rb") as inp_f:
-            receive_file(identity, keystore, inp_f, dest_path, nonce_cache)
+            receive_file(identity, keystore, Path(args.identity).parent, args.name, inp_f, dest_path, nonce_cache)
     else:
         inp_stream = sys.stdin.buffer
-        receive_file(identity, keystore, inp_stream, dest_path, nonce_cache)
+        receive_file(identity, keystore, Path(args.identity).parent, args.name, inp_stream, dest_path, nonce_cache)
 
     print(f"Received: → {dest_path}", file=sys.stderr)
 
@@ -236,33 +310,42 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_showid.set_defaults(func=_cmd_show_id)
 
+    # ── register ────────────────────────────────────────────────────────────
+    p_reg = sub.add_parser(
+        "register",
+        help="upload identity and pre-keys to the key server",
+    )
+    p_reg.add_argument("--identity", required=True, metavar="KEY")
+    p_reg.add_argument("--name", required=True, metavar="NAME")
+    p_reg.add_argument("--server", required=True, metavar="URL")
+    p_reg.set_defaults(func=_cmd_register)
+
+    # ── pin ─────────────────────────────────────────────────────────────────
+    p_pin = sub.add_parser(
+        "pin",
+        help="fetch a peer's identity key from the server and interactively pin it",
+    )
+    p_pin.add_argument("--name", required=True, metavar="NAME")
+    p_pin.add_argument("--server", required=True, metavar="URL")
+    p_pin.add_argument("--keystore", required=True, metavar="DIR")
+    p_pin.set_defaults(func=_cmd_pin)
+
     # ── send ────────────────────────────────────────────────────────────────
     p_send = sub.add_parser(
         "send",
         help="encrypt and send a file (writes to stdout or --out FILE)",
         description=(
-            "Encrypts FILE using the receiver's public key and the sender's\n"
-            "identity.  Output goes to stdout by default (pipe to receiver)\n"
-            "or to --out FILE."
+            "Encrypts FILE using the receiver's pre-key from the server.\n"
+            "Output goes to stdout by default (pipe to receiver) or to --out FILE."
         ),
     )
     p_send.add_argument("file", metavar="FILE", help="plaintext file to send")
-    p_send.add_argument(
-        "--identity", required=True, metavar="KEY",
-        help="sender's .key file"
-    )
-    p_send.add_argument(
-        "--to", required=True, metavar="PUBKEY",
-        help="receiver's .pub file"
-    )
-    p_send.add_argument(
-        "--ttl", type=int, default=300, metavar="SECS",
-        help="transfer time-to-live in seconds (default: 300)"
-    )
-    p_send.add_argument(
-        "--out", metavar="FILE", default=None,
-        help="write encrypted output to FILE instead of stdout"
-    )
+    p_send.add_argument("--identity", required=True, metavar="KEY", help="sender's .key file")
+    p_send.add_argument("--to", required=True, metavar="NAME", help="receiver's name")
+    p_send.add_argument("--server", required=True, metavar="URL", help="key server URL")
+    p_send.add_argument("--keystore", required=True, metavar="DIR", help="pinned keystore directory")
+    p_send.add_argument("--ttl", type=int, default=300, metavar="SECS")
+    p_send.add_argument("--out", metavar="FILE", default=None)
     p_send.set_defaults(func=_cmd_send)
 
     # ── receive ─────────────────────────────────────────────────────────────
@@ -279,6 +362,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_recv.add_argument(
         "--identity", required=True, metavar="KEY",
         help="receiver's .key file"
+    )
+    p_recv.add_argument(
+        "--name", required=True, metavar="NAME",
+        help="receiver's name (used for pre-key consumption)"
     )
     p_recv.add_argument(
         "--keystore", required=True, metavar="DIR",
