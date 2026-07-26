@@ -441,8 +441,7 @@ async def _receive_v2(
         prekey_priv, preamble.ephemeral_pub, preamble.stream_salt
     )
     puller = SecretstreamPuller(stream_key, preamble.stream_header)
-    
-    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
+    await _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
 
 
 async def _process_payload(

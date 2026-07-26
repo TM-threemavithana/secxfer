@@ -6,7 +6,7 @@ from typing import Optional
 import sys
 import asyncio
 
-from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError
+from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError, get_unused_prekeys
 from secxfer.transfer import send_file_v1, send_file_v2, receive_file, NonceCache, ProtocolError, AsyncReader, AsyncWriter
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,9 @@ class SecXferClient:
         self.identity = load_identity(self.identity_path)
         self.keystore = Keystore.from_directory(self.keystore_dir)
         self.nonce_cache = NonceCache(db_path=self.keystore_dir / "nonces.db")
+        
+        # Identity name is usually the stem of the identity file
+        self.identity_name = self.identity_path.stem
         
         if len(self.keystore) == 0:
             logger.warning(f"No .pub files found in {self.keystore_dir}. Transfers from any sender will be rejected.")
@@ -45,8 +48,14 @@ class SecXferClient:
 
         if server_url:
             # V2 (Server-Assisted / X3DH mode)
-            logger.info(f"Using server-assisted V2 transfer via {server_url} to {receiver_name}")
-            req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_name)
+            pub_file = self.keystore_dir / f"{receiver_name}.pub"
+            if not pub_file.exists():
+                raise ProtocolError(f"Receiver {receiver_name} is not pinned! Run 'pin' first.")
+            pinned_peer_bytes = pub_file.read_bytes()
+            receiver_key_id = key_id_from_x25519_pubkey(pinned_peer_bytes[:32])
+
+            logger.info(f"Using server-assisted V2 transfer via {server_url} to {receiver_name} ({receiver_key_id.hex()})")
+            req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_key_id.hex())
 
             def fetch_keys():
                 with urllib.request.urlopen(req) as response:
@@ -58,12 +67,11 @@ class SecXferClient:
                 raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
 
             server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
-            receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
             
             try:
                 pinned_peer = self.keystore.get(receiver_key_id)
             except UnknownSenderError:
-                raise ProtocolError(f"Receiver {receiver_name} is not pinned! Pin them first.")
+                raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
             
             if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
                 raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
@@ -102,7 +110,6 @@ class SecXferClient:
 
     async def receive(
         self,
-        identity_name: str,
         inp_stream: AsyncReader,
         dest_path: Path | str,
     ) -> None:
@@ -115,8 +122,40 @@ class SecXferClient:
             self.identity, 
             self.keystore, 
             self.identity_path.parent, 
-            identity_name, 
+            self.identity_name, 
             inp_stream, 
             dest_path, 
             self.nonce_cache
         )
+
+    async def upload_keys(self, server_url: str) -> dict:
+        """
+        Upload the local identity and unused prekeys to the central key directory.
+        """
+        prekeys = get_unused_prekeys(self.identity_path.parent, self.identity_name)
+        if not prekeys:
+            logger.warning("No unused prekeys found to upload. Run keygen again to generate more.")
+            return {"prekeys_added": 0}
+
+        payload = {
+            "key_id": self.identity.key_id.hex(),
+            "identity_pubkey": (self.identity.x25519_pubkey + self.identity.ed25519_pubkey).hex(),
+            "prekeys": prekeys
+        }
+
+        req = urllib.request.Request(
+            server_url.rstrip("/") + "/upload",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}
+        )
+
+        def do_upload():
+            with urllib.request.urlopen(req) as response:
+                return json.loads(response.read().decode())
+
+        try:
+            data = await asyncio.to_thread(do_upload)
+            logger.info(f"Successfully uploaded keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
+            return data
+        except Exception as exc:
+            raise ProtocolError(f"Failed to upload keys to server: {exc}")

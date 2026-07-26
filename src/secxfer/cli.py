@@ -1,3 +1,28 @@
+from __future__ import annotations
+
+import argparse
+import sys
+
+def _cmd_qr_show(args: argparse.Namespace) -> None:
+    from secxfer.keystore import load_identity
+    import segno
+    
+    identity = load_identity(Path(args.identity))
+    # We embed the key_id and public key
+    full_pubkey = (identity.x25519_pubkey + identity.ed25519_pubkey).hex()
+    key_id = identity.key_id.hex()
+    
+    payload = f"secxfer://identity/{key_id}/{full_pubkey}"
+    qr = segno.make_qr(payload)
+    
+    print(f"\nQR Code for Identity: {args.identity}\n")
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")
+    qr.terminal(compact=True, out=sys.stdout)
+    print(f"\nKey ID: {key_id}\n")
+    print("Scan this to verify the identity out-of-band.\n")
+
+
 """
 secxfer.cli — command-line interface.
 
@@ -22,10 +47,6 @@ This makes the tool composable with standard Unix plumbing::
     secxfer send secret.txt --identity alice.key --to bob.pub | \
         secxfer receive out.txt --identity bob.key --name bob --keystore ./keys
 """
-from __future__ import annotations
-
-import argparse
-import sys
 import logging
 from pathlib import Path
 
@@ -125,30 +146,17 @@ def _cmd_show_id(args: argparse.Namespace) -> None:
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
-    import urllib.request
-    import json
-    from secxfer.keystore import get_unused_prekeys
+    from secxfer.client import SecXferClient
+    import asyncio
     
-    identity = load_identity(Path(args.identity))
-    prekeys = get_unused_prekeys(Path(args.identity).parent, args.name)
-    if not prekeys:
-        logging.error("No unused pre-keys found. Generate with keygen.")
-        return
+    # We require a keystore to initialize the client, even if it's empty
+    keystore = Path(args.keystore) if getattr(args, "keystore", None) else Path(args.identity).parent / "keystore"
+    keystore.mkdir(exist_ok=True)
     
-    full_pubkey = identity.x25519_pubkey + identity.ed25519_pubkey
-    payload = {
-        "name": args.name,
-        "identity_pubkey": full_pubkey.hex(),
-        "prekeys": prekeys
-    }
-    req = urllib.request.Request(
-        args.server + "/register", 
-        data=json.dumps(payload).encode(), 
-        headers={'Content-Type': 'application/json'}
-    )
+    client = SecXferClient(args.identity, keystore)
     try:
-        with urllib.request.urlopen(req) as response:
-            logging.info(f"Registered successfully: {response.read().decode()}")
+        data = asyncio.run(client.upload_keys(args.server))
+        print(f"Registered successfully! Added {data.get('prekeys_added')} prekeys.")
     except Exception as exc:
         logging.error(f"Registration failed: {exc}")
 
@@ -156,25 +164,34 @@ def _cmd_register(args: argparse.Namespace) -> None:
 def _cmd_pin(args: argparse.Namespace) -> None:
     import urllib.request
     import json
-    req = urllib.request.Request(args.server + "/keys/" + args.name)
+    from pathlib import Path
+    
+    # We fetch by key_id
+    req = urllib.request.Request(args.server.rstrip("/") + "/keys/" + args.key_id)
     try:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
-        logging.error(f"Failed to fetch key for {args.name}: {exc}")
+        logging.error(f"Failed to fetch key for {args.key_id}: {exc}")
         return
 
-    ident_hex = data["identity_pubkey"]
-    logging.info(f"Server provided identity key for {args.name}: {ident_hex}")
-    ans = input("Trust this fingerprint? [y/N]: ")
-    if ans.strip().lower() == 'y':
-        keystore_dir = Path(args.keystore)
-        keystore_dir.mkdir(parents=True, exist_ok=True)
-        pub_path = keystore_dir / f"{args.name}.pub"
-        pub_path.write_bytes(bytes.fromhex(ident_hex))
-        logging.info(f"Pinned {args.name} in {pub_path}")
-    else:
-        logging.info("Pinning aborted.")
+    identity_pubkey_hex = data["identity_pubkey"]
+    prekey_data = data.get("prekey")
+    
+    keystore_dir = Path(args.keystore)
+    keystore_dir.mkdir(parents=True, exist_ok=True)
+    
+    pub_path = keystore_dir / f"{args.name}.pub"
+    pub_path.write_bytes(bytes.fromhex(identity_pubkey_hex))
+    logging.info(f"Pinned identity to {pub_path}")
+    
+    if prekey_data:
+        pk_dir = keystore_dir / f"{args.name}_prekeys"
+        pk_dir.mkdir(parents=True, exist_ok=True)
+        pk_id = prekey_data["id"]
+        pk_pub = prekey_data["pubkey"]
+        (pk_dir / f"{pk_id}.pub").write_bytes(bytes.fromhex(pk_pub))
+        logging.info(f"Saved one-time pre-key {pk_id} for V2 transfers")
 
 
 def _cmd_send(args: argparse.Namespace) -> None:
@@ -239,7 +256,7 @@ def _cmd_receive(args: argparse.Namespace) -> None:
             return await asyncio.to_thread(self.f.read, n)
 
     async def _run_receive(inp_f):
-        await client.receive(args.name, AsyncFileWrapper(inp_f), dest_path)
+        await client.receive(AsyncFileWrapper(inp_f), dest_path)
 
     if args.input:
         inp_path = Path(args.input)
@@ -305,7 +322,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="upload identity and pre-keys to the key server",
     )
     p_reg.add_argument("--identity", required=True, metavar="KEY")
-    p_reg.add_argument("--name", required=True, metavar="NAME")
+    p_reg.add_argument("--name", required=False, metavar="NAME")
+    p_reg.add_argument("--keystore", required=False, metavar="DIR")
     p_reg.add_argument("--server", required=True, metavar="URL")
     p_reg.set_defaults(func=_cmd_register)
 
@@ -314,10 +332,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "pin",
         help="fetch a peer's identity key from the server and interactively pin it",
     )
-    p_pin.add_argument("--name", required=True, metavar="NAME")
+    p_pin.add_argument("--key-id", required=True, metavar="ID")
+    p_pin.add_argument("--name", required=True, metavar="ALIAS", help="local alias to save as")
     p_pin.add_argument("--server", required=True, metavar="URL")
     p_pin.add_argument("--keystore", required=True, metavar="DIR")
     p_pin.set_defaults(func=_cmd_pin)
+
+
+    # ── qr ──────────────────────────────────────────────────────────────────
+    p_qr = sub.add_parser("qr", help="generate QR code for identity")
+    p_qr_sub = p_qr.add_subparsers(title="qr commands")
+    
+    p_qr_show = p_qr_sub.add_parser("show", help="show QR code in terminal")
+    p_qr_show.add_argument("--identity", required=True, metavar="KEY")
+    p_qr_show.set_defaults(func=_cmd_qr_show)
 
     # ── send ────────────────────────────────────────────────────────────────
     p_send = sub.add_parser(
@@ -352,10 +380,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--identity", required=True, metavar="KEY",
         help="receiver's .key file"
     )
-    p_recv.add_argument(
-        "--name", required=True, metavar="NAME",
-        help="receiver's name (used for pre-key consumption)"
-    )
+
     p_recv.add_argument(
         "--keystore", required=True, metavar="DIR",
         help="directory containing trusted sender .pub files"
