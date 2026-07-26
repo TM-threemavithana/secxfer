@@ -18,7 +18,14 @@ import sqlite3
 from collections import deque
 from pathlib import Path
 import threading
-from typing import BinaryIO
+from typing import BinaryIO, Protocol, Any
+import aiofiles
+
+class AsyncReader(Protocol):
+    async def read(self, n: int = -1) -> bytes: ...
+
+class AsyncWriter(Protocol):
+    async def write(self, data: bytes) -> Any: ...
 
 from secxfer.crypto import (
     CHUNK_SIZE,
@@ -87,13 +94,19 @@ from secxfer.wire import (
 # Internal framing helpers
 # ---------------------------------------------------------------------------
 
-def _write_chunk(out: BinaryIO, ciphertext: bytes) -> None:
+def _write_chunk(out: AsyncWriter, ciphertext: bytes) -> None:
+    raise RuntimeError("Use _write_chunk_async")
+
+async def _write_chunk_async(out: AsyncWriter, ciphertext: bytes) -> None:
     """Write a length-prefixed ciphertext chunk to *out*."""
-    out.write(pack_chunk_len(len(ciphertext)))
-    out.write(ciphertext)
+    await out.write(pack_chunk_len(len(ciphertext)))
+    await out.write(ciphertext)
 
 
-def _read_exact(inp: BinaryIO, n: int) -> bytes:
+def _read_exact(inp: AsyncReader, n: int) -> bytes:
+    raise RuntimeError("Use _read_exact_async")
+
+async def _read_exact_async(inp: AsyncReader, n: int) -> bytes:
     """
     Read exactly *n* bytes from *inp*.
 
@@ -102,7 +115,7 @@ def _read_exact(inp: BinaryIO, n: int) -> bytes:
     """
     buf = bytearray()
     while len(buf) < n:
-        chunk = inp.read(n - len(buf))
+        chunk = await inp.read(n - len(buf))
         if not chunk:
             raise EOFError(
                 f"Stream ended after {len(buf)} bytes; expected {n}"
@@ -111,11 +124,14 @@ def _read_exact(inp: BinaryIO, n: int) -> bytes:
     return bytes(buf)
 
 
-def _read_chunk(inp: BinaryIO) -> bytes:
+def _read_chunk(inp: AsyncReader) -> bytes:
+    raise RuntimeError("Use _read_chunk_async")
+
+async def _read_chunk_async(inp: AsyncReader) -> bytes:
     """Read one length-prefixed ciphertext chunk from *inp*."""
-    raw_len = _read_exact(inp, CHUNK_LEN_SIZE)
+    raw_len = await _read_exact_async(inp, CHUNK_LEN_SIZE)
     chunk_len = unpack_chunk_len(raw_len)
-    return _read_exact(inp, chunk_len)
+    return await _read_exact_async(inp, chunk_len)
 
 
 
@@ -187,11 +203,11 @@ class NonceCache:
 # Sender (V1)
 # ---------------------------------------------------------------------------
 
-def send_file_v1(
+async def send_file_v1(
     identity: LocalIdentity,
     receiver_pubkey_x25519: bytes,
     file_path: Path | str,
-    out: BinaryIO,
+    out: AsyncWriter,
     ttl_seconds: int = 300,
     chunk_size: int = CHUNK_SIZE,
 ) -> None:
@@ -207,14 +223,14 @@ def send_file_v1(
     )
     pusher = SecretstreamPusher(stream_key)
 
-    out.write(struct.pack(">B", PROTOCOL_VERSION_V1))
+    await out.write(struct.pack(">B", PROTOCOL_VERSION_V1))
     
     preamble = V1Preamble(
         sender_key_id=identity.key_id,
         stream_salt=stream_salt,
         stream_header=pusher.header
     )
-    out.write(preamble.pack())
+    await out.write(preamble.pack())
 
     transfer_nonce = os.urandom(16)
     meta = MetadataHeader(
@@ -224,17 +240,17 @@ def send_file_v1(
         filename=file_path.name,
         file_size=file_size,
     )
-    _write_chunk(out, pusher.push(meta.pack()))
+    await _write_chunk_async(out, pusher.push(meta.pack()))
 
     h = hashlib.sha256()
-    with file_path.open("rb") as f:
+    async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
             chunk = b'\x00' * chunk_size
             h.update(chunk)
-            _write_chunk(out, pusher.push(chunk))
+            await _write_chunk_async(out, pusher.push(chunk))
         else:
             while True:
-                chunk = f.read(chunk_size)
+                chunk = await f.read(chunk_size)
                 if not chunk:
                     break
                 
@@ -242,22 +258,22 @@ def send_file_v1(
                     chunk += b'\x00' * (chunk_size - len(chunk))
                 
                 h.update(chunk)
-                _write_chunk(out, pusher.push(chunk))
+                await _write_chunk_async(out, pusher.push(chunk))
 
     sig = sign_digest(identity.ed25519_seed, h.digest())
-    _write_chunk(out, pusher.push_final(sig))
+    await _write_chunk_async(out, pusher.push_final(sig))
 
 # ---------------------------------------------------------------------------
 # Sender (V2)
 # ---------------------------------------------------------------------------
 
-def send_file_v2(
+async def send_file_v2(
     identity: LocalIdentity,
     receiver_key_id: bytes,
     receiver_prekey_id: str,
     receiver_prekey_pubkey: bytes,
     file_path: Path | str,
-    out: BinaryIO,
+    out: AsyncWriter,
     ttl_seconds: int = 300,
     chunk_size: int = CHUNK_SIZE,
 ) -> None:
@@ -279,7 +295,7 @@ def send_file_v2(
     transcript_hash = hashlib.sha256(transcript).digest()
     sig = sign_digest(identity.ed25519_seed, transcript_hash)
 
-    out.write(struct.pack(">B", PROTOCOL_VERSION_V2))
+    await out.write(struct.pack(">B", PROTOCOL_VERSION_V2))
     preamble = V2Preamble(
         sender_key_id=identity.key_id,
         prekey_id_bytes=prekey_id_bytes,
@@ -288,7 +304,7 @@ def send_file_v2(
         stream_salt=stream_salt,
         stream_header=pusher.header
     )
-    out.write(preamble.pack())
+    await out.write(preamble.pack())
 
     transfer_nonce = os.urandom(16)
     meta = MetadataHeader(
@@ -298,17 +314,17 @@ def send_file_v2(
         filename=file_path.name,
         file_size=file_size,
     )
-    _write_chunk(out, pusher.push(meta.pack()))
+    await _write_chunk_async(out, pusher.push(meta.pack()))
 
     h = hashlib.sha256()
-    with file_path.open("rb") as f:
+    async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
             chunk = b'\x00' * chunk_size
             h.update(chunk)
-            _write_chunk(out, pusher.push(chunk))
+            await _write_chunk_async(out, pusher.push(chunk))
         else:
             while True:
-                chunk = f.read(chunk_size)
+                chunk = await f.read(chunk_size)
                 if not chunk:
                     break
                 
@@ -316,21 +332,21 @@ def send_file_v2(
                     chunk += b'\x00' * (chunk_size - len(chunk))
                 
                 h.update(chunk)
-                _write_chunk(out, pusher.push(chunk))
+                await _write_chunk_async(out, pusher.push(chunk))
 
     sig_file = sign_digest(identity.ed25519_seed, h.digest())
-    _write_chunk(out, pusher.push_final(sig_file))
+    await _write_chunk_async(out, pusher.push_final(sig_file))
 
 # ---------------------------------------------------------------------------
 # Receiver (Dynamic)
 # ---------------------------------------------------------------------------
 
-def receive_file(
+async def receive_file(
     identity: LocalIdentity,
     keystore: Keystore,
     keystore_dir: Path | str,
     identity_name: str,
-    inp: BinaryIO,
+    inp: AsyncReader,
     dest_path: Path | str,
     nonce_cache: NonceCache,
 ) -> None:
@@ -338,26 +354,26 @@ def receive_file(
     Dynamically read the version byte and route to the correct receiver.
     """
     try:
-        version_byte = _read_exact(inp, 1)
+        version_byte = await _read_exact_async(inp, 1)
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
     (version,) = struct.unpack(">B", version_byte)
     
     if version == PROTOCOL_VERSION_V1:
-        _receive_v1(identity, keystore, inp, dest_path, nonce_cache)
+        await _receive_v1(identity, keystore, inp, dest_path, nonce_cache)
     elif version == PROTOCOL_VERSION_V2:
-        _receive_v2(identity, keystore, keystore_dir, identity_name, inp, dest_path, nonce_cache)
+        await _receive_v2(identity, keystore, keystore_dir, identity_name, inp, dest_path, nonce_cache)
     else:
         raise VersionError(
             f"Unsupported protocol version: 0x{version:02x}"
         )
 
 
-def _receive_v1(
+async def _receive_v1(
     identity: LocalIdentity,
     keystore: Keystore,
-    inp: BinaryIO,
+    inp: AsyncReader,
     dest_path: Path | str,
     nonce_cache: NonceCache,
 ) -> None:
@@ -365,7 +381,7 @@ def _receive_v1(
     part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
     try:
-        raw_preamble = _read_exact(inp, PREAMBLE_SIZE_V1)
+        raw_preamble = await _read_exact_async(inp, PREAMBLE_SIZE_V1)
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
@@ -381,15 +397,15 @@ def _receive_v1(
     )
     puller = SecretstreamPuller(stream_key, preamble.stream_header)
     
-    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
+    await _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
 
 
-def _receive_v2(
+async def _receive_v2(
     identity: LocalIdentity,
     keystore: Keystore,
     keystore_dir: Path | str,
     identity_name: str,
-    inp: BinaryIO,
+    inp: AsyncReader,
     dest_path: Path | str,
     nonce_cache: NonceCache,
 ) -> None:
@@ -397,7 +413,7 @@ def _receive_v2(
     part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
     try:
-        raw_preamble = _read_exact(inp, PREAMBLE_SIZE_V2)
+        raw_preamble = await _read_exact_async(inp, PREAMBLE_SIZE_V2)
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
@@ -429,17 +445,17 @@ def _receive_v2(
     _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
 
 
-def _process_payload(
+async def _process_payload(
     peer, 
     puller, 
-    inp, 
+    inp: AsyncReader, 
     part_path, 
     dest_path, 
     nonce_cache, 
     sender_key_id
 ):
     try:
-        raw_meta_ct = _read_chunk(inp)
+        raw_meta_ct = await _read_chunk_async(inp)
         meta_plaintext, is_final = puller.pull(raw_meta_ct)
     except (EOFError, AuthenticationError) as exc:
         raise AuthenticationError("Metadata chunk failed authentication") from exc
@@ -472,13 +488,13 @@ def _process_payload(
             pass
 
     try:
-        with part_path.open("wb") as part_f:
+        async with aiofiles.open(part_path, "wb") as part_f:
             got_final = False
             sig = b""
             h = hashlib.sha256()
             while True:
                 try:
-                    raw_ct = _read_chunk(inp)
+                    raw_ct = await _read_chunk_async(inp)
                 except EOFError as exc:
                     raise TruncationError(
                         "Stream ended before TAG_FINAL"
@@ -496,7 +512,7 @@ def _process_payload(
                     got_final = True
                     break
 
-                part_f.write(plaintext)
+                await part_f.write(plaintext)
                 h.update(plaintext)
 
         if not got_final:
@@ -509,8 +525,8 @@ def _process_payload(
             _cleanup()
             raise
 
-        with part_path.open("a") as f:
-            f.truncate(meta.file_size)
+        async with aiofiles.open(part_path, "a") as f:
+            await f.truncate(meta.file_size)
 
         os.replace(part_path, dest_path)
 

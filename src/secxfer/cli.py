@@ -180,6 +180,15 @@ def _cmd_pin(args: argparse.Namespace) -> None:
 def _cmd_send(args: argparse.Namespace) -> None:
     """Encrypt and send a file to stdout (or --out FILE)."""
     from secxfer.client import SecXferClient
+    import asyncio
+    
+    class AsyncFileWrapper:
+        def __init__(self, f):
+            self.f = f
+        async def write(self, data):
+            return await asyncio.to_thread(self.f.write, data)
+        async def close(self):
+            pass
     
     file_path = Path(args.file)
     # Determine out stream
@@ -195,13 +204,16 @@ def _cmd_send(args: argparse.Namespace) -> None:
         keystore_dir = Path(args.keystore) if args.keystore else Path(args.identity).parent
         client = SecXferClient(args.identity, keystore_dir)
         
-        client.send(
-            receiver_name=args.to,
-            file_path=file_path,
-            out_stream=out_f,
-            server_url=args.server,
-            ttl_seconds=args.ttl
-        )
+        async def _run_send():
+            await client.send(
+                receiver_name=args.to,
+                file_path=file_path,
+                out_stream=AsyncFileWrapper(out_f),
+                server_url=args.server,
+                ttl_seconds=args.ttl
+            )
+        
+        asyncio.run(_run_send())
             
         if args.out:
             logging.info(f"Sent: {file_path} → {out_path}")
@@ -218,13 +230,24 @@ def _cmd_receive(args: argparse.Namespace) -> None:
 
     dest_path = Path(args.dest)
 
+    import asyncio
+
+    class AsyncFileWrapper:
+        def __init__(self, f):
+            self.f = f
+        async def read(self, n=-1):
+            return await asyncio.to_thread(self.f.read, n)
+
+    async def _run_receive(inp_f):
+        await client.receive(args.name, AsyncFileWrapper(inp_f), dest_path)
+
     if args.input:
         inp_path = Path(args.input)
         with inp_path.open("rb") as inp_f:
-            client.receive(args.name, inp_f, dest_path)
+            asyncio.run(_run_receive(inp_f))
     else:
         inp_stream = sys.stdin.buffer
-        client.receive(args.name, inp_stream, dest_path)
+        asyncio.run(_run_receive(inp_stream))
 
     logging.info(f"Received: → {dest_path}")
 

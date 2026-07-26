@@ -1,4 +1,5 @@
 import pytest
+from async_mock import AsyncBytesIO
 import tempfile
 import struct
 import hashlib
@@ -51,7 +52,8 @@ def test_env(tmp_path):
         "tmp_path": tmp_path,
     }
 
-def test_unpinned_sender_hard_fails(test_env):
+@pytest.mark.asyncio
+async def test_unpinned_sender_hard_fails(test_env):
     """
     Validates that a transfer from an unpinned sender is immediately rejected,
     preventing any pre-key burning or cryptographic processing.
@@ -64,8 +66,8 @@ def test_unpinned_sender_hard_fails(test_env):
     keystore = Keystore.from_directory(test_env["bob_ks_dir"])
     nonce_cache = NonceCache()
     
-    out = BytesIO()
-    send_file(
+    out = AsyncBytesIO()
+    await send_file(
         identity=alice,
         receiver_key_id=bob.key_id,
         receiver_prekey_id=bob_pks[0]["id"],
@@ -77,7 +79,7 @@ def test_unpinned_sender_hard_fails(test_env):
     out.seek(0)
     
     with pytest.raises(UnknownSenderError):
-        receive_file(
+        await receive_file(
             identity=bob,
             keystore=keystore,
             keystore_dir=test_env["bob_dir"],
@@ -87,7 +89,8 @@ def test_unpinned_sender_hard_fails(test_env):
             nonce_cache=nonce_cache,
         )
 
-def test_dual_store_desync_fails_safely(test_env):
+@pytest.mark.asyncio
+async def test_dual_store_desync_fails_safely(test_env):
     """
     Simulates a race or server compromise where the server hands out a pre-key
     that the receiver has already consumed locally.
@@ -108,8 +111,8 @@ def test_dual_store_desync_fails_safely(test_env):
     pk_path = test_env["bob_dir"] / "bob_prekeys" / f"{target_pk['id']}.key"
     pk_path.rename(pk_path.with_suffix('.used'))
     
-    out = BytesIO()
-    send_file(
+    out = AsyncBytesIO()
+    await send_file(
         identity=alice,
         receiver_key_id=bob.key_id,
         receiver_prekey_id=target_pk["id"],
@@ -122,7 +125,7 @@ def test_dual_store_desync_fails_safely(test_env):
     
     # 2. Attempt to receive using the burned pre-key
     with pytest.raises(PreKeyConsumedError, match="does not exist or was already consumed"):
-        receive_file(
+        await receive_file(
             identity=bob,
             keystore=keystore,
             keystore_dir=test_env["bob_dir"],
@@ -132,7 +135,8 @@ def test_dual_store_desync_fails_safely(test_env):
             nonce_cache=nonce_cache,
         )
 
-def test_context_binding_unknown_key_share(test_env):
+@pytest.mark.asyncio
+async def test_context_binding_unknown_key_share(test_env):
     """
     Simulates an Unknown-Key-Share (UKS) attack.
     Alice signs a transfer intended for Bob, but Mallory forwards it to Carol.
@@ -149,10 +153,10 @@ def test_context_binding_unknown_key_share(test_env):
     carol_keystore = Keystore.from_directory(test_env["carol_ks_dir"])
     nonce_cache = NonceCache()
     
-    out = BytesIO()
+    out = AsyncBytesIO()
     
     # 1. Alice creates a transfer legitimately for Bob
-    send_file(
+    await send_file(
         identity=alice,
         receiver_key_id=bob.key_id,
         receiver_prekey_id=bob_pks[0]["id"],
@@ -173,7 +177,7 @@ def test_context_binding_unknown_key_share(test_env):
     # But Alice signed:
     # ephemeral_pub + bob.key_id + (the prekey ID from the wire)
     with pytest.raises(SignatureError, match="Sender authentication failed"):
-        receive_file(
+        await receive_file(
             identity=carol,
             keystore=carol_keystore,
             keystore_dir=test_env["tmp_path"] / "carol",

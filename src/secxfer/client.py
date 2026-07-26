@@ -1,12 +1,13 @@
-﻿import logging
+import logging
 import urllib.request
 import json
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import Optional
 import sys
+import asyncio
 
 from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError
-from secxfer.transfer import send_file_v1, send_file_v2, receive_file, NonceCache, ProtocolError
+from secxfer.transfer import send_file_v1, send_file_v2, receive_file, NonceCache, ProtocolError, AsyncReader, AsyncWriter
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,11 @@ class SecXferClient:
         if len(self.keystore) == 0:
             logger.warning(f"No .pub files found in {self.keystore_dir}. Transfers from any sender will be rejected.")
 
-    def send(
+    async def send(
         self,
         receiver_name: str,
         file_path: Path | str,
-        out_stream: BinaryIO,
+        out_stream: AsyncWriter,
         server_url: Optional[str] = None,
         ttl_seconds: int = 300,
     ) -> None:
@@ -46,9 +47,13 @@ class SecXferClient:
             # V2 (Server-Assisted / X3DH mode)
             logger.info(f"Using server-assisted V2 transfer via {server_url} to {receiver_name}")
             req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_name)
-            try:
+
+            def fetch_keys():
                 with urllib.request.urlopen(req) as response:
-                    data = json.loads(response.read().decode())
+                    return json.loads(response.read().decode())
+
+            try:
+                data = await asyncio.to_thread(fetch_keys)
             except Exception as exc:
                 raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
 
@@ -66,7 +71,7 @@ class SecXferClient:
             receiver_prekey_id = data["prekey"]["id"]
             receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
 
-            send_file_v2(
+            await send_file_v2(
                 self.identity,
                 receiver_key_id,
                 receiver_prekey_id,
@@ -87,7 +92,7 @@ class SecXferClient:
                 raise ValueError("Public key file must be exactly 64 bytes (X25519 + Ed25519).")
             receiver_pubkey_x25519 = pubkey_bytes[:32]
 
-            send_file_v1(
+            await send_file_v1(
                 self.identity,
                 receiver_pubkey_x25519,
                 file_path,
@@ -95,10 +100,10 @@ class SecXferClient:
                 ttl_seconds=ttl_seconds,
             )
 
-    def receive(
+    async def receive(
         self,
         identity_name: str,
-        inp_stream: BinaryIO,
+        inp_stream: AsyncReader,
         dest_path: Path | str,
     ) -> None:
         """
@@ -106,7 +111,7 @@ class SecXferClient:
         """
         dest_path = Path(dest_path)
         logger.info(f"Receiving transfer to {dest_path}")
-        receive_file(
+        await receive_file(
             self.identity, 
             self.keystore, 
             self.identity_path.parent, 

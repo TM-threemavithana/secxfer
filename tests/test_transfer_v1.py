@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import pytest
+from async_mock import AsyncBytesIO
 
 from secxfer.keystore import (
     Keystore,
@@ -109,7 +110,7 @@ def _assert_no_partial(dest: Path) -> None:
     assert not _part_path(dest).exists(), f"{_part_path(dest)} should not exist after failure"
 
 
-def _transfer(
+async def _transfer(
     sender: LocalIdentity,
     receiver: LocalIdentity,
     receiver_keystore: Keystore,
@@ -119,10 +120,10 @@ def _transfer(
     ttl_seconds: int = 300,
 ) -> None:
     """Helper: send src_path from sender ΓåÆ receiver; write result to dest_path."""
-    buf = io.BytesIO()
-    send_file(sender, receiver.x25519_pubkey, src_path, buf, ttl_seconds=ttl_seconds)
+    buf = AsyncBytesIO()
+    await send_file(sender, receiver.x25519_pubkey, src_path, buf, ttl_seconds=ttl_seconds)
     buf.seek(0)
-    receive_file(
+    await receive_file(
         receiver,
         receiver_keystore,
         "",
@@ -138,11 +139,13 @@ def _transfer(
 # ---------------------------------------------------------------------------
 
 class TestNonceCache:
-    def test_first_insert_succeeds(self):
+    @pytest.mark.asyncio
+    async def test_first_insert_succeeds(self):
         cache = NonceCache()
         cache.check_and_insert(b"\x00" * 8, b"\x01" * 16, ttl_seconds=60)
 
-    def test_replay_within_ttl_raises(self):
+    @pytest.mark.asyncio
+    async def test_replay_within_ttl_raises(self):
         cache = NonceCache()
         kid = b"\x00" * 8
         nonce = b"\x01" * 16
@@ -150,19 +153,22 @@ class TestNonceCache:
         with pytest.raises(ReplayError):
             cache.check_and_insert(kid, nonce, ttl_seconds=60)
 
-    def test_different_nonce_accepted(self):
+    @pytest.mark.asyncio
+    async def test_different_nonce_accepted(self):
         cache = NonceCache()
         kid = b"\x00" * 8
         cache.check_and_insert(kid, b"\x01" * 16, ttl_seconds=60)
         cache.check_and_insert(kid, b"\x02" * 16, ttl_seconds=60)  # different nonce ΓÇö ok
 
-    def test_different_sender_accepted(self):
+    @pytest.mark.asyncio
+    async def test_different_sender_accepted(self):
         cache = NonceCache()
         nonce = b"\x01" * 16
         cache.check_and_insert(b"\xAA" * 8, nonce, ttl_seconds=60)
         cache.check_and_insert(b"\xBB" * 8, nonce, ttl_seconds=60)  # same nonce, different sender ΓÇö ok
 
-    def test_eviction_after_ttl(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_eviction_after_ttl(self, monkeypatch):
         """After TTL expires, the same nonce should be accepted again."""
         cache = NonceCache()
         kid = b"\x00" * 8
@@ -178,7 +184,8 @@ class TestNonceCache:
         # Should succeed after eviction
         cache.check_and_insert(kid, nonce, ttl_seconds=60)
 
-    def test_len_reflects_active_entries(self):
+    @pytest.mark.asyncio
+    async def test_len_reflects_active_entries(self):
         cache = NonceCache()
         assert len(cache) == 0
         cache.check_and_insert(b"\x00" * 8, b"\x01" * 16, ttl_seconds=60)
@@ -186,7 +193,8 @@ class TestNonceCache:
         cache.check_and_insert(b"\x00" * 8, b"\x02" * 16, ttl_seconds=60)
         assert len(cache) == 2
 
-    def test_many_inserts_evict_correctly(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_many_inserts_evict_correctly(self, monkeypatch):
         """Amortised eviction keeps cache bounded under many inserts."""
         cache = NonceCache()
         base_time = time.time()
@@ -207,7 +215,8 @@ class TestNonceCache:
         # Cache should not grow unboundedly ΓÇö entries older than TTL are gone
         assert len(cache) < 100
 
-    def test_concurrent_threading_exactly_one_wins(self):
+    @pytest.mark.asyncio
+    async def test_concurrent_threading_exactly_one_wins(self):
         """
         20 threads simultaneously insert the same (key_id, nonce) via the
         lock-protected check_and_insert.  Exactly one must succeed; the
@@ -275,54 +284,60 @@ class TestNonceCache:
 # ---------------------------------------------------------------------------
 
 class TestRoundtrip:
-    def test_small_file(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_small_file(self, tmp, alice, bob, bob_keystore):
         src = tmp / "hello.txt"
         src.write_bytes(b"hello, world")
         dest = tmp / "received.txt"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.read_bytes() == b"hello, world"
 
-    def test_large_file(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_large_file(self, tmp, alice, bob, bob_keystore):
         data = os.urandom(300_000)   # ~3 chunks at 64 KiB each
         src = tmp / "large.bin"
         src.write_bytes(data)
         dest = tmp / "large_recv.bin"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.read_bytes() == data
 
-    def test_empty_file(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_empty_file(self, tmp, alice, bob, bob_keystore):
         src = tmp / "empty.bin"
         src.write_bytes(b"")
         dest = tmp / "empty_recv.bin"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.read_bytes() == b""
 
-    def test_exact_chunk_boundary(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_exact_chunk_boundary(self, tmp, alice, bob, bob_keystore):
         """File size exactly equal to CHUNK_SIZE ΓÇö tests edge case in read-ahead."""
         from secxfer.crypto import CHUNK_SIZE
         data = os.urandom(CHUNK_SIZE)
         src = tmp / "exact.bin"
         src.write_bytes(data)
         dest = tmp / "exact_recv.bin"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.read_bytes() == data
 
-    def test_dest_not_created_on_success_uses_exact_path(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_dest_not_created_on_success_uses_exact_path(self, tmp, alice, bob, bob_keystore):
         src = tmp / "file.bin"
         src.write_bytes(b"test content")
         dest = tmp / "output.bin"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.exists()
         assert not (tmp / "output.bin.part").exists()
 
-    def test_filename_preserved_in_metadata(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_filename_preserved_in_metadata(self, tmp, alice, bob, bob_keystore):
         """Filename in metadata header round-trips correctly (not verified by
         receive_file directly, but the metadata is AEAD-protected so any
         tampering would cause AuthenticationError ΓÇö round-trip confirms encoding)."""
         src = tmp / "myspecialfile.dat"
         src.write_bytes(b"data")
         dest = tmp / "out.dat"
-        _transfer(alice, bob, bob_keystore, src, dest)
+        await _transfer(alice, bob, bob_keystore, src, dest)
         assert dest.exists()
 
 
@@ -331,32 +346,34 @@ class TestRoundtrip:
 # ---------------------------------------------------------------------------
 
 class TestNegative:
-    def _send_to_buffer(
+    async def _send_to_buffer(
         self, sender, receiver, src_path, ttl_seconds=300
     ) -> io.BytesIO:
-        buf = io.BytesIO()
-        send_file(
+        buf = AsyncBytesIO()
+        await send_file(
             sender, receiver.x25519_pubkey, src_path, buf, ttl_seconds=ttl_seconds
         )
         buf.seek(0)
         return buf
 
-    def test_wrong_receiver_key_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_wrong_receiver_key_raises(self, tmp, alice, bob, bob_keystore):
         """A receiver with the wrong private key cannot decrypt ΓÇö AuthenticationError."""
         src = tmp / "secret.bin"
         src.write_bytes(b"top secret")
         dest = tmp / "out.bin"
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
 
         # Generate a different identity for the "receiver"
         wrong_identity = generate_keypair(tmp / "wrong", name="identity")
 
         with pytest.raises(AuthenticationError):
-            receive_file(wrong_identity, bob_keystore, "", "bob", buf, dest, NonceCache())
+            await receive_file(wrong_identity, bob_keystore, "", "bob", buf, dest, NonceCache())
 
         _assert_no_partial(dest)
 
-    def test_tampered_data_chunk_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_tampered_data_chunk_raises(self, tmp, alice, bob, bob_keystore):
         """Flipping a bit in a data chunk ΓåÆ AuthenticationError; .part deleted.
 
         Byte _PREAMBLE_SIZE + 200 = offset 257. Stream layout: preamble ends
@@ -368,58 +385,61 @@ class TestNegative:
         src = tmp / "data.bin"
         src.write_bytes(os.urandom(1000))
         dest = tmp / "out.bin"
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
 
         raw = bytearray(buf.getvalue())
         raw[_PREAMBLE_SIZE + 200] ^= 0xFF
         with pytest.raises(AuthenticationError):
-            receive_file(bob, bob_keystore, "", "bob", io.BytesIO(bytes(raw)), dest, NonceCache())
+            await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(bytes(raw)), dest, NonceCache())
 
         _assert_no_partial(dest)
 
-    def test_truncated_stream_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_truncated_stream_raises(self, tmp, alice, bob, bob_keystore):
         """Dropping the final chunk ΓåÆ TruncationError or AuthenticationError; .part deleted."""
         src = tmp / "data.bin"
         src.write_bytes(os.urandom(200_000))   # multiple chunks
         dest = tmp / "out.bin"
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
 
         # Truncate to 60% of stream ΓÇö removes final chunk(s)
         raw = buf.getvalue()
         truncated = raw[: int(len(raw) * 0.6)]
 
         with pytest.raises((TruncationError, AuthenticationError, ProtocolError)):
-            receive_file(bob, bob_keystore, "", "bob", io.BytesIO(truncated), dest, NonceCache())
+            await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(truncated), dest, NonceCache())
 
         _assert_no_partial(dest)
 
-    def test_replay_within_ttl_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_replay_within_ttl_raises(self, tmp, alice, bob, bob_keystore):
         """Replaying an identical transfer within the TTL window ΓåÆ ReplayError."""
         src = tmp / "data.bin"
         src.write_bytes(b"replay me")
         dest1 = tmp / "out1.bin"
         dest2 = tmp / "out2.bin"
 
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
         raw = buf.getvalue()
 
         cache = NonceCache()
-        receive_file(bob, bob_keystore, "", "bob", io.BytesIO(raw), dest1, cache)
+        await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(raw), dest1, cache)
 
         with pytest.raises(ReplayError):
-            receive_file(bob, bob_keystore, "", "bob", io.BytesIO(raw), dest2, cache)
+            await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(raw), dest2, cache)
 
         # ReplayError is raised before .part is opened ΓÇö both checks apply
         _assert_no_partial(dest2)
 
-    def test_expired_transfer_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_expired_transfer_raises(self, tmp, alice, bob, bob_keystore):
         """Transfer with ttl=1 received after 2 seconds ΓåÆ TTLError."""
         src = tmp / "data.bin"
         src.write_bytes(b"old transfer")
         dest = tmp / "out.bin"
 
-        buf = io.BytesIO()
-        send_file(alice, bob.x25519_pubkey, src, buf, ttl_seconds=1)
+        buf = AsyncBytesIO()
+        await send_file(alice, bob.x25519_pubkey, src, buf, ttl_seconds=1)
         buf.seek(0)
         raw = buf.getvalue()
 
@@ -428,44 +448,47 @@ class TestNegative:
         try:
             time.time = lambda: original_time() + 10  # 10 seconds later
             with pytest.raises(TTLError):
-                receive_file(bob, bob_keystore, "", "bob", io.BytesIO(raw), dest, NonceCache())
+                await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(raw), dest, NonceCache())
         finally:
             time.time = original_time
 
         # TTLError is raised before .part is opened
         _assert_no_partial(dest)
 
-    def test_unknown_sender_raises(self, tmp, alice, bob):
+    @pytest.mark.asyncio
+    async def test_unknown_sender_raises(self, tmp, alice, bob):
         """Sender's key_id not in keystore ΓåÆ UnknownSenderError."""
         src = tmp / "data.bin"
         src.write_bytes(b"from alice")
         dest = tmp / "out.bin"
 
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
         empty_keystore = Keystore({})   # knows nobody
 
         with pytest.raises(UnknownSenderError):
-            receive_file(bob, empty_keystore, "", "bob", buf, dest, NonceCache())
+            await receive_file(bob, empty_keystore, "", "bob", buf, dest, NonceCache())
 
         # UnknownSenderError is raised before .part is opened
         _assert_no_partial(dest)
 
-    def test_bad_version_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_bad_version_raises(self, tmp, alice, bob, bob_keystore):
         """Wrong version byte in preamble ΓåÆ VersionError."""
         src = tmp / "data.bin"
         src.write_bytes(b"hello")
         dest = tmp / "out.bin"
 
-        buf = self._send_to_buffer(alice, bob, src)
+        buf = await self._send_to_buffer(alice, bob, src)
         raw = bytearray(buf.getvalue())
         raw[0] = 0xFF   # corrupt version byte
         with pytest.raises(VersionError):
-            receive_file(bob, bob_keystore, "", "bob", io.BytesIO(bytes(raw)), dest, NonceCache())
+            await receive_file(bob, bob_keystore, "", "bob", AsyncBytesIO(bytes(raw)), dest, NonceCache())
 
         # VersionError is raised before .part is opened
         _assert_no_partial(dest)
 
-    def test_tampered_signature_raises(self, tmp, alice, bob, bob_keystore):
+    @pytest.mark.asyncio
+    async def test_tampered_signature_raises(self, tmp, alice, bob, bob_keystore):
         """Ed25519 signature tampered ΓåÆ SignatureError; .part file deleted.
 
         AEAD protects the metadata chunk (including the signature field), so
@@ -493,12 +516,12 @@ class TestNegative:
             key_id=alice.key_id,
         )
         # Bob's keystore still expects Alice's real Ed25519 pubkey
-        forged_buf = io.BytesIO()
-        send_file(forged_identity, bob.x25519_pubkey, src, forged_buf)
+        forged_buf = AsyncBytesIO()
+        await send_file(forged_identity, bob.x25519_pubkey, src, forged_buf)
         forged_buf.seek(0)
 
         with pytest.raises(SignatureError):
-            receive_file(bob, bob_keystore, "", "bob", forged_buf, dest, NonceCache())
+            await receive_file(bob, bob_keystore, "", "bob", forged_buf, dest, NonceCache())
 
         # SignatureError cleanup: .part is fully written then deleted before raise
         _assert_no_partial(dest)
