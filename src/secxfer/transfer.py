@@ -13,6 +13,7 @@ import hashlib
 import os
 import struct
 import time
+import sqlite3
 from collections import deque
 from pathlib import Path
 import threading
@@ -175,12 +176,26 @@ def _unpack_metadata(raw: bytes) -> dict:
 class NonceCache:
     """
     Short-lived cache of seen ``(sender_key_id, transfer_nonce)`` pairs.
+    Backed by SQLite for persistence across process restarts.
     """
 
-    def __init__(self) -> None:
-        self._cache: dict[tuple[bytes, bytes], float] = {}
-        self._queue: deque[tuple[float, tuple[bytes, bytes]]] = deque()
+    def __init__(self, db_path: Path | str | None = None) -> None:
         self._lock = threading.Lock()
+        if db_path is None:
+            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        self._conn.execute(
+            '''CREATE TABLE IF NOT EXISTS nonces (
+                sender_key_id BLOB,
+                transfer_nonce BLOB,
+                expiry REAL,
+                PRIMARY KEY (sender_key_id, transfer_nonce)
+            )'''
+        )
+        self._conn.execute('CREATE INDEX IF NOT EXISTS idx_expiry ON nonces(expiry)')
+        self._conn.commit()
 
     def check_and_insert(
         self,
@@ -188,29 +203,33 @@ class NonceCache:
         transfer_nonce: bytes,
         ttl_seconds: int,
     ) -> None:
-        now = time.monotonic()
-        key = (sender_key_id, transfer_nonce)
+        now = time.time()
+        expiry = now + ttl_seconds
 
         with self._lock:
-            while self._queue:
-                expiry, queued_key = self._queue[0]
-                if expiry > now:
-                    break
-                self._queue.popleft()
-                if self._cache.get(queued_key) == expiry:
-                    del self._cache[queued_key]
+            # Evict expired nonces
+            self._conn.execute('DELETE FROM nonces WHERE expiry <= ?', (now,))
 
-            if key in self._cache:
+            try:
+                self._conn.execute(
+                    'INSERT INTO nonces (sender_key_id, transfer_nonce, expiry) VALUES (?, ?, ?)',
+                    (sender_key_id, transfer_nonce, expiry)
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
                 raise ReplayError(
                     f"Replay detected: nonce {transfer_nonce.hex()} "
                     f"from sender {sender_key_id.hex()} already seen."
                 )
-            expiry = now + ttl_seconds
-            self._cache[key] = expiry
-            self._queue.append((expiry, key))
 
     def __len__(self) -> int:
-        return len(self._cache)
+        with self._lock:
+            cursor = self._conn.execute('SELECT COUNT(*) FROM nonces')
+            return cursor.fetchone()[0]
+
+    def close(self) -> None:
+        self._conn.close()
 
 # ---------------------------------------------------------------------------
 # Sender (V1)
@@ -258,12 +277,21 @@ def send_file_v1(
 
     h = hashlib.sha256()
     with file_path.open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
+        if file_size == 0:
+            chunk = b'\x00' * chunk_size
             h.update(chunk)
             _write_chunk(out, pusher.push(chunk))
+        else:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                
+                if len(chunk) < chunk_size:
+                    chunk += b'\x00' * (chunk_size - len(chunk))
+                
+                h.update(chunk)
+                _write_chunk(out, pusher.push(chunk))
 
     sig = sign_digest(identity.ed25519_seed, h.digest())
     _write_chunk(out, pusher.push_final(sig))
@@ -325,12 +353,21 @@ def send_file_v2(
 
     h = hashlib.sha256()
     with file_path.open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
+        if file_size == 0:
+            chunk = b'\x00' * chunk_size
             h.update(chunk)
             _write_chunk(out, pusher.push(chunk))
+        else:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                
+                if len(chunk) < chunk_size:
+                    chunk += b'\x00' * (chunk_size - len(chunk))
+                
+                h.update(chunk)
+                _write_chunk(out, pusher.push(chunk))
 
     sig_file = sign_digest(identity.ed25519_seed, h.digest())
     _write_chunk(out, pusher.push_final(sig_file))
@@ -516,6 +553,9 @@ def _process_payload(
         except SignatureError:
             _cleanup()
             raise
+
+        with part_path.open("a") as f:
+            f.truncate(meta["file_size"])
 
         os.replace(part_path, dest_path)
 

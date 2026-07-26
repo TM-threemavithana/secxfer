@@ -15,15 +15,6 @@ Primitives used
                  (crypto_secretstream_xchacha20poly1305)
 - Signing:       Ed25519 via nacl.signing
 - Hashing:       SHA-256 via stdlib hashlib
-
-Known limitation
-----------------
-The sender must hash the entire file before constructing the metadata header
-(chunk 0 carries the Ed25519 signature over SHA-256(plaintext)), which forces
-two sequential passes over the file: one for hashing, one for encryption.
-For large files this means 2x disk I/O and no hash-while-streaming.
-Fixing this (e.g., trailer-based signing) would require reopening the
-header-placement decision; deferred to a future version.
 """
 from __future__ import annotations
 

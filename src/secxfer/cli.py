@@ -270,7 +270,8 @@ def _cmd_receive(args: argparse.Namespace) -> None:
         )
 
     dest_path = Path(args.dest)
-    nonce_cache = NonceCache()
+    db_path = Path(args.keystore) / "nonces.db"
+    nonce_cache = NonceCache(db_path=db_path)
 
     if args.input:
         inp_path = Path(args.input)

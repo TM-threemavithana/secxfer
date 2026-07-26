@@ -172,8 +172,8 @@ class TestNonceCache:
         cache.check_and_insert(kid, nonce, ttl_seconds=1)
 
         # Fast-forward time past TTL using monkeypatch
-        original_monotonic = time.monotonic
-        monkeypatch.setattr(time, "monotonic", lambda: original_monotonic() + 2)
+        original_time = time.time
+        monkeypatch.setattr(time, "time", lambda: original_time() + 2)
 
         # Should succeed after eviction
         cache.check_and_insert(kid, nonce, ttl_seconds=60)
@@ -189,16 +189,16 @@ class TestNonceCache:
     def test_many_inserts_evict_correctly(self, monkeypatch):
         """Amortised eviction keeps cache bounded under many inserts."""
         cache = NonceCache()
-        base_time = time.monotonic()
+        base_time = time.time()
         call_count = 0
 
-        def fake_monotonic():
+        def fake_time():
             nonlocal call_count
             call_count += 1
             # Advance time by 1s every 10 calls to trigger evictions
             return base_time + (call_count // 10)
 
-        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(time, "time", fake_time)
 
         for i in range(100):
             nonce = i.to_bytes(16, "big")
