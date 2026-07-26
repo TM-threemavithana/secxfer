@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# secxfer specific runtime files
+# DO NOT COMMIT PRIVATE KEYS!
+*.key
+*.pub
+*-keys/
+*keys/
+
+# Test/runtime data files
+*.bin
+*.part
+secret.txt
+received.txt
+out.txt
