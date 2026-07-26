@@ -10,7 +10,7 @@ Commands
   secxfer keygen   --dir DIR [--name NAME]
   secxfer register --identity KEY --name NAME --server URL
   secxfer pin      --name NAME --server URL --keystore DIR
-  secxfer send     FILE --identity KEY --to NAME --server URL --keystore DIR [--ttl SECS] [--out FILE]
+  secxfer send     FILE --identity KEY --to DEST [--server URL] [--keystore DIR] [--ttl SECS] [--out FILE]
   secxfer receive  DEST --identity KEY --name NAME --keystore DIR [--in FILE]
   secxfer show-id  --identity KEY
 
@@ -19,15 +19,8 @@ Transport model
 send writes to stdout (or --out FILE); receive reads from stdin (or --in FILE).
 This makes the tool composable with standard Unix plumbing::
 
-    secxfer send secret.txt --identity alice.key --to bob --server http://localhost:8000 --keystore ./keys | \
+    secxfer send secret.txt --identity alice.key --to bob.pub | \
         secxfer receive out.txt --identity bob.key --name bob --keystore ./keys
-
-Nonce cache lifetime
---------------------
-The NonceCache is created fresh per invocation.  For a single-shot CLI this
-is correct; replay protection works within a single session.  For a
-long-running service, persist the cache across invocations or use an
-external store (see threat model §5).
 """
 from __future__ import annotations
 
@@ -40,6 +33,7 @@ from secxfer.keystore import (
     UnknownSenderError,
     generate_keypair,
     load_identity,
+    Keystore,
 )
 from secxfer.transfer import (
     NonceCache,
@@ -48,10 +42,11 @@ from secxfer.transfer import (
     TTLError,
     TruncationError,
     VersionError,
+    PreKeyConsumedError,
     receive_file,
-    send_file,
+    send_file_v1,
+    send_file_v2,
 )
-from secxfer.keystore import Keystore
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         TruncationError,
         VersionError,
         UnknownSenderError,
+        PreKeyConsumedError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -182,39 +178,50 @@ def _cmd_send(args: argparse.Namespace) -> None:
 
     """Encrypt and send a file to stdout (or --out FILE)."""
     identity = load_identity(Path(args.identity))
-    keystore = Keystore.from_directory(Path(args.keystore))
-
-    # Fetch prekey from server
-    req = urllib.request.Request(args.server + "/keys/" + args.to)
-    try:
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
-    except Exception as exc:
-        raise ProtocolError(f"Failed to fetch keys for {args.to} from server: {exc}")
-
-    server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
-    
-    # Bidirectional TOFU Check!
-    receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
-    try:
-        pinned_peer = keystore.get(receiver_key_id)
-    except UnknownSenderError:
-        raise ProtocolError(f"Receiver {args.to} is not pinned! Run 'secxfer pin' first.")
-    
-    if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
-        raise ProtocolError(f"CRITICAL: Server returned a different identity key for {args.to} than your pinned version! MITM attack detected.")
-
-    receiver_prekey_id = data["prekey"]["id"]
-    receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
 
     file_path = Path(args.file)
     if not file_path.exists():
         raise FileNotFoundError(file_path)
 
+    # Determine out stream
+    out_f = None
     if args.out:
         out_path = Path(args.out)
-        with out_path.open("wb") as out_f:
-            send_file(
+        out_f = out_path.open("wb")
+    else:
+        out_f = sys.stdout.buffer
+
+    try:
+        if args.server:
+            # V2 (Server-Assisted / X3DH mode)
+            if not args.keystore:
+                raise ProtocolError("--keystore is required when using --server for pinned identity verification")
+                
+            keystore = Keystore.from_directory(Path(args.keystore))
+
+            # Fetch prekey from server
+            req = urllib.request.Request(args.server + "/keys/" + args.to)
+            try:
+                with urllib.request.urlopen(req) as response:
+                    data = json.loads(response.read().decode())
+            except Exception as exc:
+                raise ProtocolError(f"Failed to fetch keys for {args.to} from server: {exc}")
+
+            server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+            receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
+            
+            try:
+                pinned_peer = keystore.get(receiver_key_id)
+            except UnknownSenderError:
+                raise ProtocolError(f"Receiver {args.to} is not pinned! Run 'secxfer pin' first.")
+            
+            if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+                raise ProtocolError(f"CRITICAL: Server returned a different identity key for {args.to} than your pinned version! MITM attack detected.")
+
+            receiver_prekey_id = data["prekey"]["id"]
+            receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
+
+            send_file_v2(
                 identity,
                 receiver_key_id,
                 receiver_prekey_id,
@@ -223,19 +230,31 @@ def _cmd_send(args: argparse.Namespace) -> None:
                 out_f,
                 ttl_seconds=args.ttl,
             )
-        print(f"Sent: {file_path} → {out_path}", file=sys.stderr)
-    else:
-        # Write to stdout in binary mode
-        out_stream = sys.stdout.buffer
-        send_file(
-            identity,
-            receiver_key_id,
-            receiver_prekey_id,
-            receiver_prekey_pubkey,
-            file_path,
-            out_stream,
-            ttl_seconds=args.ttl,
-        )
+        else:
+            # V1 (P2P mode)
+            pub_path = Path(args.to)
+            if not pub_path.exists():
+                raise FileNotFoundError(f"Public key file not found: {pub_path}")
+
+            pubkey_bytes = pub_path.read_bytes()
+            if len(pubkey_bytes) != 64:
+                raise ValueError("Public key file must be exactly 64 bytes (X25519 + Ed25519).")
+            receiver_pubkey_x25519 = pubkey_bytes[:32]
+
+            send_file_v1(
+                identity,
+                receiver_pubkey_x25519,
+                file_path,
+                out_f,
+                ttl_seconds=args.ttl,
+            )
+            
+        if args.out:
+            print(f"Sent: {file_path} → {out_path}", file=sys.stderr)
+            
+    finally:
+        if args.out and out_f:
+            out_f.close()
 
 
 def _cmd_receive(args: argparse.Namespace) -> None:
@@ -273,7 +292,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="secxfer",
         description=(
             "Cryptographically secure file transfer using pre-shared keys.\n"
-            "Primitives: X25519 + HKDF-SHA256, XChaCha20-Poly1305 (secretstream), Ed25519."
+            "Primitives: X25519 + HKDF-SHA256, XChaCha20-Poly1305 (secretstream), Ed25519.\n"
+            "Supports V1 (P2P) and V2 (Forward Secrecy / Server-Assisted) modes."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -341,9 +361,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_send.add_argument("file", metavar="FILE", help="plaintext file to send")
     p_send.add_argument("--identity", required=True, metavar="KEY", help="sender's .key file")
-    p_send.add_argument("--to", required=True, metavar="NAME", help="receiver's name")
-    p_send.add_argument("--server", required=True, metavar="URL", help="key server URL")
-    p_send.add_argument("--keystore", required=True, metavar="DIR", help="pinned keystore directory")
+    p_send.add_argument("--to", required=True, metavar="NAME", help="receiver's name (V2) or path to .pub file (V1)")
+    p_send.add_argument("--server", default=None, metavar="URL", help="key server URL (triggers V2 Forward Secrecy mode)")
+    p_send.add_argument("--keystore", default=None, metavar="DIR", help="pinned keystore directory (required for V2)")
     p_send.add_argument("--ttl", type=int, default=300, metavar="SECS")
     p_send.add_argument("--out", metavar="FILE", default=None)
     p_send.set_defaults(func=_cmd_send)

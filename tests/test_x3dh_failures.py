@@ -6,7 +6,7 @@ from pathlib import Path
 from io import BytesIO
 
 from secxfer.keystore import generate_keypair, Keystore, key_id_from_x25519_pubkey, UnknownSenderError
-from secxfer.transfer import send_file, receive_file, ProtocolError, PreKeyConsumedError, _PREAMBLE_FMT
+from secxfer.transfer import send_file_v2 as send_file, receive_file, ProtocolError, PreKeyConsumedError, _PREAMBLE_FMT_V2 as _PREAMBLE_FMT
 from secxfer.crypto import SignatureError
 from secxfer.transfer import NonceCache
 
@@ -171,7 +171,7 @@ def test_context_binding_unknown_key_share(test_env):
     # ephemeral_pub + carol.key_id + (the prekey ID from the wire)
     # But Alice signed:
     # ephemeral_pub + bob.key_id + (the prekey ID from the wire)
-    with pytest.raises(ProtocolError, match="Sender authentication failed"):
+    with pytest.raises(SignatureError, match="Sender authentication failed"):
         receive_file(
             identity=carol,
             keystore=carol_keystore,
