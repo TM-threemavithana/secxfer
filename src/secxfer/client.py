@@ -1,0 +1,117 @@
+﻿import logging
+import urllib.request
+import json
+from pathlib import Path
+from typing import BinaryIO, Optional
+import sys
+
+from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError
+from secxfer.transfer import send_file_v1, send_file_v2, receive_file, NonceCache, ProtocolError
+
+logger = logging.getLogger(__name__)
+
+class SecXferClient:
+    """
+    SDK wrapper for the secxfer file transfer protocol.
+    Maintains identity, keystore, and nonce cache state.
+    """
+
+    def __init__(self, identity_path: Path | str, keystore_dir: Path | str):
+        self.identity_path = Path(identity_path)
+        self.keystore_dir = Path(keystore_dir)
+        self.identity = load_identity(self.identity_path)
+        self.keystore = Keystore.from_directory(self.keystore_dir)
+        self.nonce_cache = NonceCache(db_path=self.keystore_dir / "nonces.db")
+        
+        if len(self.keystore) == 0:
+            logger.warning(f"No .pub files found in {self.keystore_dir}. Transfers from any sender will be rejected.")
+
+    def send(
+        self,
+        receiver_name: str,
+        file_path: Path | str,
+        out_stream: BinaryIO,
+        server_url: Optional[str] = None,
+        ttl_seconds: int = 300,
+    ) -> None:
+        """
+        Sends a file. If server_url is provided, uses V2 Forward Secrecy.
+        Otherwise, receiver_name must be a path to a public key (V1).
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        if server_url:
+            # V2 (Server-Assisted / X3DH mode)
+            logger.info(f"Using server-assisted V2 transfer via {server_url} to {receiver_name}")
+            req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_name)
+            try:
+                with urllib.request.urlopen(req) as response:
+                    data = json.loads(response.read().decode())
+            except Exception as exc:
+                raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
+
+            server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+            receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
+            
+            try:
+                pinned_peer = self.keystore.get(receiver_key_id)
+            except UnknownSenderError:
+                raise ProtocolError(f"Receiver {receiver_name} is not pinned! Pin them first.")
+            
+            if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+                raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
+
+            receiver_prekey_id = data["prekey"]["id"]
+            receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
+
+            send_file_v2(
+                self.identity,
+                receiver_key_id,
+                receiver_prekey_id,
+                receiver_prekey_pubkey,
+                file_path,
+                out_stream,
+                ttl_seconds=ttl_seconds,
+            )
+        else:
+            # V1 (P2P mode)
+            logger.info(f"Using P2P V1 transfer to {receiver_name}")
+            pub_path = Path(receiver_name)
+            if not pub_path.exists():
+                raise FileNotFoundError(f"Public key file not found: {pub_path}")
+
+            pubkey_bytes = pub_path.read_bytes()
+            if len(pubkey_bytes) != 64:
+                raise ValueError("Public key file must be exactly 64 bytes (X25519 + Ed25519).")
+            receiver_pubkey_x25519 = pubkey_bytes[:32]
+
+            send_file_v1(
+                self.identity,
+                receiver_pubkey_x25519,
+                file_path,
+                out_stream,
+                ttl_seconds=ttl_seconds,
+            )
+
+    def receive(
+        self,
+        identity_name: str,
+        inp_stream: BinaryIO,
+        dest_path: Path | str,
+    ) -> None:
+        """
+        Decrypt and verify a file from a binary stream.
+        """
+        dest_path = Path(dest_path)
+        logger.info(f"Receiving transfer to {dest_path}")
+        receive_file(
+            self.identity, 
+            self.keystore, 
+            self.identity_path.parent, 
+            identity_name, 
+            inp_stream, 
+            dest_path, 
+            self.nonce_cache
+        )

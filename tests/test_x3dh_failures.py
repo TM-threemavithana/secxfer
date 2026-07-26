@@ -6,9 +6,10 @@ from pathlib import Path
 from io import BytesIO
 
 from secxfer.keystore import generate_keypair, Keystore, key_id_from_x25519_pubkey, UnknownSenderError
-from secxfer.transfer import send_file_v2 as send_file, receive_file, ProtocolError, PreKeyConsumedError, _PREAMBLE_FMT_V2 as _PREAMBLE_FMT
+from secxfer.transfer import send_file_v2 as send_file, receive_file, ProtocolError, PreKeyConsumedError
 from secxfer.crypto import SignatureError
 from secxfer.transfer import NonceCache
+from secxfer.wire import _PREAMBLE_FMT_V2 as _PREAMBLE_FMT
 
 @pytest.fixture
 def test_env(tmp_path):

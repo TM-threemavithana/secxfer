@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import logging
 from pathlib import Path
 
 from secxfer.crypto import AuthenticationError, SignatureError
@@ -59,6 +60,12 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns exit code (0 = success, 1 = error).
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s: %(message)s',
+        stream=sys.stderr
+    )
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -80,16 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         UnknownSenderError,
         PreKeyConsumedError,
     ) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logging.error(str(exc))
         return 1
     except FileNotFoundError as exc:
-        print(f"error: file not found — {exc}", file=sys.stderr)
+        logging.error(f"file not found — {exc}")
         return 1
     except FileExistsError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logging.error(str(exc))
         return 1
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
+        logging.info("Interrupted.")
         return 1
 
 
@@ -106,8 +113,7 @@ def _cmd_keygen(args: argparse.Namespace) -> None:
     print(f"  Public key  : {key_dir / args.name}.pub  (share with peers)")
     print(f"  Key ID      : {identity.key_id.hex()}")
     print()
-    print("Share the .pub file with anyone who should be able to receive")
-    print("files from you, or whose files you want to send to.")
+    print("Share the .pub file with anyone who should be able to receive files from you, or whose files you want to send to.")
 
 
 def _cmd_show_id(args: argparse.Namespace) -> None:
@@ -126,7 +132,7 @@ def _cmd_register(args: argparse.Namespace) -> None:
     identity = load_identity(Path(args.identity))
     prekeys = get_unused_prekeys(Path(args.identity).parent, args.name)
     if not prekeys:
-        print("No unused pre-keys found. Generate with keygen.", file=sys.stderr)
+        logging.error("No unused pre-keys found. Generate with keygen.")
         return
     
     full_pubkey = identity.x25519_pubkey + identity.ed25519_pubkey
@@ -142,9 +148,9 @@ def _cmd_register(args: argparse.Namespace) -> None:
     )
     try:
         with urllib.request.urlopen(req) as response:
-            print(f"Registered successfully: {response.read().decode()}")
+            logging.info(f"Registered successfully: {response.read().decode()}")
     except Exception as exc:
-        print(f"Registration failed: {exc}", file=sys.stderr)
+        logging.error(f"Registration failed: {exc}")
 
 
 def _cmd_pin(args: argparse.Namespace) -> None:
@@ -155,34 +161,27 @@ def _cmd_pin(args: argparse.Namespace) -> None:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode())
     except Exception as exc:
-        print(f"Failed to fetch key for {args.name}: {exc}", file=sys.stderr)
+        logging.error(f"Failed to fetch key for {args.name}: {exc}")
         return
 
     ident_hex = data["identity_pubkey"]
-    print(f"Server provided identity key for {args.name}: {ident_hex}")
+    logging.info(f"Server provided identity key for {args.name}: {ident_hex}")
     ans = input("Trust this fingerprint? [y/N]: ")
     if ans.strip().lower() == 'y':
         keystore_dir = Path(args.keystore)
         keystore_dir.mkdir(parents=True, exist_ok=True)
         pub_path = keystore_dir / f"{args.name}.pub"
         pub_path.write_bytes(bytes.fromhex(ident_hex))
-        print(f"Pinned {args.name} in {pub_path}")
+        logging.info(f"Pinned {args.name} in {pub_path}")
     else:
-        print("Pinning aborted.")
+        logging.info("Pinning aborted.")
 
 
 def _cmd_send(args: argparse.Namespace) -> None:
-    import urllib.request
-    import json
-    from secxfer.keystore import key_id_from_x25519_pubkey
-
     """Encrypt and send a file to stdout (or --out FILE)."""
-    identity = load_identity(Path(args.identity))
-
+    from secxfer.client import SecXferClient
+    
     file_path = Path(args.file)
-    if not file_path.exists():
-        raise FileNotFoundError(file_path)
-
     # Determine out stream
     out_f = None
     if args.out:
@@ -192,65 +191,20 @@ def _cmd_send(args: argparse.Namespace) -> None:
         out_f = sys.stdout.buffer
 
     try:
-        if args.server:
-            # V2 (Server-Assisted / X3DH mode)
-            if not args.keystore:
-                raise ProtocolError("--keystore is required when using --server for pinned identity verification")
-                
-            keystore = Keystore.from_directory(Path(args.keystore))
-
-            # Fetch prekey from server
-            req = urllib.request.Request(args.server + "/keys/" + args.to)
-            try:
-                with urllib.request.urlopen(req) as response:
-                    data = json.loads(response.read().decode())
-            except Exception as exc:
-                raise ProtocolError(f"Failed to fetch keys for {args.to} from server: {exc}")
-
-            server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
-            receiver_key_id = key_id_from_x25519_pubkey(server_ident_bytes[:32])
-            
-            try:
-                pinned_peer = keystore.get(receiver_key_id)
-            except UnknownSenderError:
-                raise ProtocolError(f"Receiver {args.to} is not pinned! Run 'secxfer pin' first.")
-            
-            if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
-                raise ProtocolError(f"CRITICAL: Server returned a different identity key for {args.to} than your pinned version! MITM attack detected.")
-
-            receiver_prekey_id = data["prekey"]["id"]
-            receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
-
-            send_file_v2(
-                identity,
-                receiver_key_id,
-                receiver_prekey_id,
-                receiver_prekey_pubkey,
-                file_path,
-                out_f,
-                ttl_seconds=args.ttl,
-            )
-        else:
-            # V1 (P2P mode)
-            pub_path = Path(args.to)
-            if not pub_path.exists():
-                raise FileNotFoundError(f"Public key file not found: {pub_path}")
-
-            pubkey_bytes = pub_path.read_bytes()
-            if len(pubkey_bytes) != 64:
-                raise ValueError("Public key file must be exactly 64 bytes (X25519 + Ed25519).")
-            receiver_pubkey_x25519 = pubkey_bytes[:32]
-
-            send_file_v1(
-                identity,
-                receiver_pubkey_x25519,
-                file_path,
-                out_f,
-                ttl_seconds=args.ttl,
-            )
+        # Default to identity's parent dir for keystore if not specified (for P2P mode)
+        keystore_dir = Path(args.keystore) if args.keystore else Path(args.identity).parent
+        client = SecXferClient(args.identity, keystore_dir)
+        
+        client.send(
+            receiver_name=args.to,
+            file_path=file_path,
+            out_stream=out_f,
+            server_url=args.server,
+            ttl_seconds=args.ttl
+        )
             
         if args.out:
-            print(f"Sent: {file_path} → {out_path}", file=sys.stderr)
+            logging.info(f"Sent: {file_path} → {out_path}")
             
     finally:
         if args.out and out_f:
@@ -259,29 +213,20 @@ def _cmd_send(args: argparse.Namespace) -> None:
 
 def _cmd_receive(args: argparse.Namespace) -> None:
     """Decrypt and verify a file from stdin (or --in FILE) to DEST."""
-    identity = load_identity(Path(args.identity))
-    keystore = Keystore.from_directory(Path(args.keystore))
-
-    if len(keystore) == 0:
-        print(
-            f"warning: no .pub files found in {args.keystore} — "
-            "transfers from any sender will be rejected",
-            file=sys.stderr,
-        )
+    from secxfer.client import SecXferClient
+    client = SecXferClient(args.identity, args.keystore)
 
     dest_path = Path(args.dest)
-    db_path = Path(args.keystore) / "nonces.db"
-    nonce_cache = NonceCache(db_path=db_path)
 
     if args.input:
         inp_path = Path(args.input)
         with inp_path.open("rb") as inp_f:
-            receive_file(identity, keystore, Path(args.identity).parent, args.name, inp_f, dest_path, nonce_cache)
+            client.receive(args.name, inp_f, dest_path)
     else:
         inp_stream = sys.stdin.buffer
-        receive_file(identity, keystore, Path(args.identity).parent, args.name, inp_stream, dest_path, nonce_cache)
+        client.receive(args.name, inp_stream, dest_path)
 
-    print(f"Received: → {dest_path}", file=sys.stderr)
+    logging.info(f"Received: → {dest_path}")
 
 
 # ---------------------------------------------------------------------------

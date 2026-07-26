@@ -49,12 +49,12 @@ from secxfer.transfer import (
     SignatureError,
     TTLError,
     TruncationError,
-    _PREAMBLE_SIZE_V1 as _PREAMBLE_SIZE,
-    _PROTOCOL_VERSION_V1 as _PROTOCOL_VERSION,
     VersionError,
+    PreKeyConsumedError,
     receive_file,
     send_file_v1 as send_file,
 )
+from secxfer.wire import PREAMBLE_SIZE_V1 as _PREAMBLE_SIZE, _PREAMBLE_FMT_V1 as _PREAMBLE_FMT
 from secxfer.crypto import AuthenticationError
 from secxfer.keystore import UnknownSenderError
 

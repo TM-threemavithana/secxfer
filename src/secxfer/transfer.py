@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import os
 import struct
 import time
 import sqlite3
@@ -67,24 +68,19 @@ class TruncationError(ProtocolError):
 # Wire format constants
 # ---------------------------------------------------------------------------
 
-_PROTOCOL_VERSION_V1: int = 0x01
-_PREAMBLE_FMT_V1: str = ">8s24s24s" # (version byte read separately)
-_PREAMBLE_SIZE_V1: int = struct.calcsize(_PREAMBLE_FMT_V1)
-
-_PROTOCOL_VERSION_V2: int = 0x02
-_PREAMBLE_FMT_V2: str = ">8s16s32s64s24s24s" # (version byte read separately)
-_PREAMBLE_SIZE_V2: int = struct.calcsize(_PREAMBLE_FMT_V2)
-
-_CHUNK_LEN_FMT: str = ">I"                             # uint32 big-endian
-_CHUNK_LEN_SIZE: int = 4
-
-# Metadata header fixed prefix: nonce(16s) + timestamp(Q) + ttl(I) + fname_len(H)
-_META_FIXED_FMT: str = ">16sQIH"
-_META_FIXED_SIZE: int = struct.calcsize(_META_FIXED_FMT)  # 30 bytes
-
-_FILE_SIZE_FMT: str = ">Q"
-_FILE_SIZE_SIZE: int = 8
-_SIG_SIZE: int = 64
+from secxfer.wire import (
+    PROTOCOL_VERSION_V1,
+    PROTOCOL_VERSION_V2,
+    PREAMBLE_SIZE_V1,
+    PREAMBLE_SIZE_V2,
+    CHUNK_LEN_SIZE,
+    WireError,
+    MetadataHeader,
+    V1Preamble,
+    V2Preamble,
+    pack_chunk_len,
+    unpack_chunk_len,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +89,7 @@ _SIG_SIZE: int = 64
 
 def _write_chunk(out: BinaryIO, ciphertext: bytes) -> None:
     """Write a length-prefixed ciphertext chunk to *out*."""
-    out.write(struct.pack(_CHUNK_LEN_FMT, len(ciphertext)))
+    out.write(pack_chunk_len(len(ciphertext)))
     out.write(ciphertext)
 
 
@@ -117,56 +113,12 @@ def _read_exact(inp: BinaryIO, n: int) -> bytes:
 
 def _read_chunk(inp: BinaryIO) -> bytes:
     """Read one length-prefixed ciphertext chunk from *inp*."""
-    raw_len = _read_exact(inp, _CHUNK_LEN_SIZE)
-    (chunk_len,) = struct.unpack(_CHUNK_LEN_FMT, raw_len)
+    raw_len = _read_exact(inp, CHUNK_LEN_SIZE)
+    chunk_len = unpack_chunk_len(raw_len)
     return _read_exact(inp, chunk_len)
 
 
-# ---------------------------------------------------------------------------
-# Metadata header serialisation / deserialisation
-# ---------------------------------------------------------------------------
 
-def _pack_metadata(
-    transfer_nonce: bytes,
-    timestamp: int,
-    ttl: int,
-    filename: str,
-    file_size: int,
-) -> bytes:
-    fname_bytes = filename.encode("utf-8")
-    return (
-        struct.pack(_META_FIXED_FMT, transfer_nonce, timestamp, ttl, len(fname_bytes))
-        + fname_bytes
-        + struct.pack(_FILE_SIZE_FMT, file_size)
-    )
-
-
-def _unpack_metadata(raw: bytes) -> dict:
-    if len(raw) < _META_FIXED_SIZE:
-        raise ProtocolError("Metadata header too short")
-
-    transfer_nonce, timestamp, ttl, fname_len = struct.unpack_from(
-        _META_FIXED_FMT, raw, 0
-    )
-    offset = _META_FIXED_SIZE
-    required = offset + fname_len + _FILE_SIZE_SIZE
-
-    if len(raw) < required:
-        raise ProtocolError(
-            f"Metadata header truncated: need {required} bytes, got {len(raw)}"
-        )
-
-    filename = raw[offset : offset + fname_len].decode("utf-8")
-    offset += fname_len
-    (file_size,) = struct.unpack_from(_FILE_SIZE_FMT, raw, offset)
-
-    return {
-        "transfer_nonce": transfer_nonce,
-        "timestamp": timestamp,
-        "ttl": ttl,
-        "filename": filename,
-        "file_size": file_size,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -255,25 +207,24 @@ def send_file_v1(
     )
     pusher = SecretstreamPusher(stream_key)
 
-    out.write(struct.pack(">B", _PROTOCOL_VERSION_V1))
-    out.write(
-        struct.pack(
-            _PREAMBLE_FMT_V1,
-            identity.key_id,
-            stream_salt,
-            pusher.header,
-        )
+    out.write(struct.pack(">B", PROTOCOL_VERSION_V1))
+    
+    preamble = V1Preamble(
+        sender_key_id=identity.key_id,
+        stream_salt=stream_salt,
+        stream_header=pusher.header
     )
+    out.write(preamble.pack())
 
     transfer_nonce = os.urandom(16)
-    meta_plaintext = _pack_metadata(
+    meta = MetadataHeader(
         transfer_nonce=transfer_nonce,
         timestamp=int(time.time()),
         ttl=ttl_seconds,
         filename=file_path.name,
         file_size=file_size,
     )
-    _write_chunk(out, pusher.push(meta_plaintext))
+    _write_chunk(out, pusher.push(meta.pack()))
 
     h = hashlib.sha256()
     with file_path.open("rb") as f:
@@ -328,28 +279,26 @@ def send_file_v2(
     transcript_hash = hashlib.sha256(transcript).digest()
     sig = sign_digest(identity.ed25519_seed, transcript_hash)
 
-    out.write(struct.pack(">B", _PROTOCOL_VERSION_V2))
-    out.write(
-        struct.pack(
-            _PREAMBLE_FMT_V2,
-            identity.key_id,
-            prekey_id_bytes,
-            ephemeral_pub,
-            sig,
-            stream_salt,
-            pusher.header,
-        )
+    out.write(struct.pack(">B", PROTOCOL_VERSION_V2))
+    preamble = V2Preamble(
+        sender_key_id=identity.key_id,
+        prekey_id_bytes=prekey_id_bytes,
+        ephemeral_pub=ephemeral_pub,
+        sig=sig,
+        stream_salt=stream_salt,
+        stream_header=pusher.header
     )
+    out.write(preamble.pack())
 
     transfer_nonce = os.urandom(16)
-    meta_plaintext = _pack_metadata(
+    meta = MetadataHeader(
         transfer_nonce=transfer_nonce,
         timestamp=int(time.time()),
         ttl=ttl_seconds,
         filename=file_path.name,
         file_size=file_size,
     )
-    _write_chunk(out, pusher.push(meta_plaintext))
+    _write_chunk(out, pusher.push(meta.pack()))
 
     h = hashlib.sha256()
     with file_path.open("rb") as f:
@@ -395,9 +344,9 @@ def receive_file(
 
     (version,) = struct.unpack(">B", version_byte)
     
-    if version == _PROTOCOL_VERSION_V1:
+    if version == PROTOCOL_VERSION_V1:
         _receive_v1(identity, keystore, inp, dest_path, nonce_cache)
-    elif version == _PROTOCOL_VERSION_V2:
+    elif version == PROTOCOL_VERSION_V2:
         _receive_v2(identity, keystore, keystore_dir, identity_name, inp, dest_path, nonce_cache)
     else:
         raise VersionError(
@@ -416,22 +365,23 @@ def _receive_v1(
     part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
     try:
-        raw_preamble = _read_exact(inp, _PREAMBLE_SIZE_V1)
+        raw_preamble = _read_exact(inp, PREAMBLE_SIZE_V1)
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
-    sender_key_id, stream_salt, stream_header = struct.unpack(
-        _PREAMBLE_FMT_V1, raw_preamble
-    )
+    try:
+        preamble = V1Preamble.unpack(raw_preamble)
+    except WireError as exc:
+        raise ProtocolError(str(exc)) from exc
 
-    peer = keystore.get(sender_key_id)
+    peer = keystore.get(preamble.sender_key_id)
 
     stream_key = derive_stream_key(
-        identity.x25519_privkey, peer.x25519, stream_salt
+        identity.x25519_privkey, peer.x25519, preamble.stream_salt
     )
-    puller = SecretstreamPuller(stream_key, stream_header)
+    puller = SecretstreamPuller(stream_key, preamble.stream_header)
     
-    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, sender_key_id)
+    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
 
 
 def _receive_v2(
@@ -447,35 +397,36 @@ def _receive_v2(
     part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
     try:
-        raw_preamble = _read_exact(inp, _PREAMBLE_SIZE_V2)
+        raw_preamble = _read_exact(inp, PREAMBLE_SIZE_V2)
     except EOFError as exc:
         raise ProtocolError("Preamble truncated") from exc
 
-    sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header = struct.unpack(
-        _PREAMBLE_FMT_V2, raw_preamble
-    )
+    try:
+        preamble = V2Preamble.unpack(raw_preamble)
+    except WireError as exc:
+        raise ProtocolError(str(exc)) from exc
 
-    peer = keystore.get(sender_key_id)
+    peer = keystore.get(preamble.sender_key_id)
 
-    transcript = ephemeral_pub + identity.key_id + prekey_id_bytes
+    transcript = preamble.ephemeral_pub + identity.key_id + preamble.prekey_id_bytes
     transcript_hash = hashlib.sha256(transcript).digest()
     try:
-        verify_digest(peer.ed25519, sig, transcript_hash)
+        verify_digest(peer.ed25519, preamble.sig, transcript_hash)
     except SignatureError as exc:
         raise SignatureError("Sender authentication failed: transcript signature invalid") from exc
 
-    prekey_id = prekey_id_bytes.decode('ascii').rstrip('\x00')
+    prekey_id = preamble.prekey_id_bytes.decode('ascii').rstrip('\x00')
     try:
         prekey_priv = consume_prekey(keystore_dir, identity_name, prekey_id)
     except FileNotFoundError:
         raise PreKeyConsumedError(f"Pre-Key {prekey_id} does not exist or was already consumed")
 
     stream_key = derive_stream_key(
-        prekey_priv, ephemeral_pub, stream_salt
+        prekey_priv, preamble.ephemeral_pub, preamble.stream_salt
     )
-    puller = SecretstreamPuller(stream_key, stream_header)
+    puller = SecretstreamPuller(stream_key, preamble.stream_header)
     
-    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, sender_key_id)
+    _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
 
 
 def _process_payload(
@@ -496,10 +447,14 @@ def _process_payload(
     if is_final:
         raise ProtocolError("Stream ended after metadata chunk; no file data")
 
-    meta = _unpack_metadata(meta_plaintext)
-    transfer_nonce: bytes = meta["transfer_nonce"]
-    timestamp: int = meta["timestamp"]
-    ttl: int = meta["ttl"]
+    try:
+        meta = MetadataHeader.unpack(meta_plaintext)
+    except WireError as exc:
+        raise ProtocolError(str(exc)) from exc
+        
+    transfer_nonce = meta.transfer_nonce
+    timestamp = meta.timestamp
+    ttl = meta.ttl
 
     now = time.time()
     if now - timestamp > ttl:
@@ -555,7 +510,7 @@ def _process_payload(
             raise
 
         with part_path.open("a") as f:
-            f.truncate(meta["file_size"])
+            f.truncate(meta.file_size)
 
         os.replace(part_path, dest_path)
 
