@@ -17,12 +17,13 @@ class SecXferClient:
     Maintains identity, keystore, and nonce cache state.
     """
 
-    def __init__(self, identity_path: Path | str, keystore_dir: Path | str):
+    def __init__(self, identity_path: str | Path, keystore_dir: str | Path, password: str | None = None, use_tor: bool = False):
         self.identity_path = Path(identity_path)
         self.keystore_dir = Path(keystore_dir)
-        self.identity = load_identity(self.identity_path)
+        self.identity = load_identity(self.identity_path, password)
         self.keystore = Keystore.from_directory(self.keystore_dir)
         self.nonce_cache = NonceCache(db_path=self.keystore_dir / "nonces.db")
+        self.http_proxy = "socks5://127.0.0.1:9050" if use_tor else None
         
         # Identity name is usually the stem of the identity file
         self.identity_name = self.identity_path.stem
@@ -127,6 +128,13 @@ class SecXferClient:
             dest_path, 
             self.nonce_cache
         )
+
+
+    def __del__(self):
+        try:
+            self.identity.wipe()
+        except Exception:
+            pass
 
     async def upload_keys(self, server_url: str) -> dict:
         """

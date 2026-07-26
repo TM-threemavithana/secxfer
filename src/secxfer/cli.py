@@ -3,11 +3,25 @@ from __future__ import annotations
 import argparse
 import sys
 
-def _cmd_qr_show(args: argparse.Namespace) -> None:
+def _load_id(path):
     from secxfer.keystore import load_identity
+    from secxfer.crypto import WrongPasswordError
+    import getpass
+    import sys
+    try:
+        return load_identity(path)
+    except WrongPasswordError:
+        while True:
+            pwd = getpass.getpass(f"Enter password to unlock {path}: ")
+            try:
+                return load_identity(path, pwd)
+            except WrongPasswordError:
+                print("Incorrect password. Please try again.", file=sys.stderr)
+
+def _cmd_qr_show(args: argparse.Namespace) -> None:
     import segno
     
-    identity = load_identity(Path(args.identity))
+    identity = _load_id(Path(args.identity))
     # We embed the key_id and public key
     full_pubkey = (identity.x25519_pubkey + identity.ed25519_pubkey).hex()
     key_id = identity.key_id.hex()
@@ -125,6 +139,24 @@ def main(argv: list[str] | None = None) -> int:
 # Subcommands
 # ---------------------------------------------------------------------------
 
+
+def _get_client(identity_path: str, keystore_dir: str, use_tor: bool = False) -> 'SecXferClient':
+    from secxfer.client import SecXferClient
+    from secxfer.crypto import WrongPasswordError
+    import getpass
+    import sys
+    
+    try:
+        return SecXferClient(identity_path, keystore_dir, use_tor=use_tor)
+    except WrongPasswordError:
+        while True:
+            pwd = getpass.getpass(f"Enter password to unlock {identity_path}: ")
+            try:
+                return SecXferClient(identity_path, keystore_dir, password=pwd, use_tor=use_tor)
+            except WrongPasswordError:
+                print("Incorrect password. Please try again.", file=sys.stderr)
+
+
 def _cmd_keygen(args: argparse.Namespace) -> None:
     """Generate a Curve25519 + Ed25519 keypair and write to disk."""
     identity = generate_keypair(Path(args.dir), name=args.name)
@@ -153,7 +185,7 @@ def _cmd_register(args: argparse.Namespace) -> None:
     keystore = Path(args.keystore) if getattr(args, "keystore", None) else Path(args.identity).parent / "keystore"
     keystore.mkdir(exist_ok=True)
     
-    client = SecXferClient(args.identity, keystore)
+    client = _get_client(args.identity, keystore, use_tor=args.tor)
     try:
         data = asyncio.run(client.upload_keys(args.server))
         print(f"Registered successfully! Added {data.get('prekeys_added')} prekeys.")
@@ -181,7 +213,16 @@ def _cmd_pin(args: argparse.Namespace) -> None:
     keystore_dir = Path(args.keystore)
     keystore_dir.mkdir(parents=True, exist_ok=True)
     
-    pub_path = keystore_dir / f"{args.name}.pub"
+pub_path = keystore_dir / f"{args.name}.pub"
+    if pub_path.exists():
+        existing_pubkey_hex = pub_path.read_bytes().hex()
+        if existing_pubkey_hex != identity_pubkey_hex:
+            if not args.force:
+                logging.error(f"WARNING: Identity for '{args.name}' has CHANGED! This could be a MITM attack or key rotation. Use --force to overwrite.")
+                return
+            else:
+                logging.warning(f"Overwriting identity for '{args.name}' due to --force.")
+                
     pub_path.write_bytes(bytes.fromhex(identity_pubkey_hex))
     logging.info(f"Pinned identity to {pub_path}")
     
@@ -219,7 +260,7 @@ def _cmd_send(args: argparse.Namespace) -> None:
     try:
         # Default to identity's parent dir for keystore if not specified (for P2P mode)
         keystore_dir = Path(args.keystore) if args.keystore else Path(args.identity).parent
-        client = SecXferClient(args.identity, keystore_dir)
+        client = _get_client(args.identity, keystore_dir, use_tor=args.tor)
         
         async def _run_send():
             await client.send(
@@ -243,7 +284,7 @@ def _cmd_send(args: argparse.Namespace) -> None:
 def _cmd_receive(args: argparse.Namespace) -> None:
     """Decrypt and verify a file from stdin (or --in FILE) to DEST."""
     from secxfer.client import SecXferClient
-    client = SecXferClient(args.identity, args.keystore)
+    client = _get_client(args.identity, args.keystore, use_tor=args.tor)
 
     dest_path = Path(args.dest)
 
@@ -335,6 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pin.add_argument("--key-id", required=True, metavar="ID")
     p_pin.add_argument("--name", required=True, metavar="ALIAS", help="local alias to save as")
     p_pin.add_argument("--server", required=True, metavar="URL")
+    p_pin.add_argument("--force", action="store_true", help="force overwrite if identity changed")
     p_pin.add_argument("--keystore", required=True, metavar="DIR")
     p_pin.set_defaults(func=_cmd_pin)
 

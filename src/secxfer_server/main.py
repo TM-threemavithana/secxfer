@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
 from typing import List
 from pydantic import BaseModel
@@ -8,6 +11,10 @@ from .database import get_db, init_db, User, PreKey
 init_db()
 
 app = FastAPI(title="SecXfer Key Directory")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 class PreKeyModel(BaseModel):
     id: str
@@ -19,7 +26,8 @@ class UploadBundle(BaseModel):
     prekeys: List[PreKeyModel]
 
 @app.post("/upload")
-def upload_bundle(bundle: UploadBundle, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def upload_bundle(request: Request, bundle: UploadBundle, db: Session = Depends(get_db)):
     # Upsert User
     user = db.query(User).filter(User.key_id == bundle.key_id).first()
     if not user:
@@ -40,7 +48,8 @@ def upload_bundle(bundle: UploadBundle, db: Session = Depends(get_db)):
     return {"message": "Keys uploaded successfully", "prekeys_added": len(bundle.prekeys)}
 
 @app.get("/keys/{key_id}")
-def get_keys(key_id: str, db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def get_keys(request: Request, key_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.key_id == key_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

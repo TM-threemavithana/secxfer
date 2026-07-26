@@ -78,6 +78,12 @@ class LocalIdentity:
     ed25519_pubkey: bytes   # 32 bytes — derived
     key_id: bytes           # 8 bytes — derived; included in wire preamble
 
+    def wipe(self):
+        """Securely zero out the private keys from RAM."""
+        from secxfer.crypto import secure_wipe
+        secure_wipe(self.x25519_privkey)
+        secure_wipe(self.ed25519_seed)
+
 
 # ---------------------------------------------------------------------------
 # Key derivation helpers
@@ -164,7 +170,7 @@ class Keystore:
 # Key generation
 # ---------------------------------------------------------------------------
 
-def generate_keypair(output_dir: Path | str, name: str = "identity", num_prekeys: int = 50) -> LocalIdentity:
+def generate_keypair(output_dir: Path | str, name: str = "identity", num_prekeys: int = 50, password: str | None = None, duress_password: str | None = None, user_entropy: bytes | None = None) -> LocalIdentity:
     """
     Generate a fresh Curve25519 + Ed25519 keypair and write it to disk.
 
@@ -194,16 +200,41 @@ def generate_keypair(output_dir: Path | str, name: str = "identity", num_prekeys
         )
 
     # Curve25519 keypair
-    x25519_priv = os.urandom(32)
+    if user_entropy:
+        # Mix OS entropy with user entropy
+        x25519_priv = hashlib.sha256(os.urandom(32) + user_entropy + b"x25519").digest()
+        ed25519_seed_raw = hashlib.sha256(os.urandom(32) + user_entropy + b"ed25519").digest()
+    else:
+        x25519_priv = os.urandom(32)
+        ed25519_seed_raw = None
+
     x25519_pub = _nb.crypto_scalarmult_base(x25519_priv)
 
     # Ed25519 keypair
-    signing_key = SigningKey.generate()
+    if ed25519_seed_raw:
+        signing_key = SigningKey(ed25519_seed_raw)
+    else:
+        signing_key = SigningKey.generate()
+        
     ed25519_seed = bytes(signing_key)
     ed25519_pub = bytes(signing_key.verify_key)
 
     # Write private key file (owner read-only where supported)
-    key_path.write_bytes(x25519_priv + ed25519_seed)
+    priv_bytes = x25519_priv + ed25519_seed
+    if password:
+        from secxfer.crypto import encrypt_private_key
+        fake_priv_bytes = None
+        if duress_password:
+            import os
+            from nacl.signing import SigningKey
+            import nacl.bindings as _nb
+            fake_x25519_priv = os.urandom(32)
+            fake_signing_key = SigningKey.generate()
+            fake_ed25519_seed = bytes(fake_signing_key)
+            fake_priv_bytes = fake_x25519_priv + fake_ed25519_seed
+        key_path.write_bytes(encrypt_private_key(priv_bytes, password, duress_password, fake_priv_bytes))
+    else:
+        key_path.write_bytes(priv_bytes)
     try:
         key_path.chmod(0o600)
     except NotImplementedError:
@@ -269,7 +300,7 @@ def consume_prekey(output_dir: Path | str, name: str, prekey_id: str) -> bytes:
     return pk_priv
 
 
-def load_identity(key_file: Path | str) -> LocalIdentity:
+def load_identity(key_file: Path | str, password: str | None = None) -> LocalIdentity:
     """
     Load a local identity from a ``*.key`` file.
 
@@ -283,10 +314,18 @@ def load_identity(key_file: Path | str) -> LocalIdentity:
         ValueError: if the file is not exactly 64 bytes.
     """
     raw = Path(key_file).read_bytes()
+    
     if len(raw) != _PRIVKEY_SIZE:
-        raise ValueError(
-            f"Expected {_PRIVKEY_SIZE}-byte key file, got {len(raw)} bytes: {key_file}"
-        )
+        # Possibly encrypted
+        if not password:
+            from secxfer.crypto import WrongPasswordError
+            raise WrongPasswordError("Key file appears to be encrypted but no password was provided.")
+        from secxfer.crypto import decrypt_private_key
+        raw = decrypt_private_key(raw, password)
+        
+    if len(raw) != _PRIVKEY_SIZE:
+        raise ValueError(f"Expected {_PRIVKEY_SIZE}-byte key after decryption.")
+
     x25519_priv = raw[:32]
     ed25519_seed = raw[32:]
 
