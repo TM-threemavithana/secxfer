@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import os
 import struct
 import time
 import sqlite3
@@ -94,17 +93,14 @@ from secxfer.wire import (
 # Internal framing helpers
 # ---------------------------------------------------------------------------
 
-def _write_chunk(out: AsyncWriter, ciphertext: bytes) -> None:
-    raise RuntimeError("Use _write_chunk_async")
+# MAX safe chunk = plaintext + secretstream overhead (17 bytes) + tolerance
+MAX_CHUNK_SIZE: int = CHUNK_SIZE + 512
 
 async def _write_chunk_async(out: AsyncWriter, ciphertext: bytes) -> None:
     """Write a length-prefixed ciphertext chunk to *out*."""
     await out.write(pack_chunk_len(len(ciphertext)))
     await out.write(ciphertext)
 
-
-def _read_exact(inp: AsyncReader, n: int) -> bytes:
-    raise RuntimeError("Use _read_exact_async")
 
 async def _read_exact_async(inp: AsyncReader, n: int) -> bytes:
     """
@@ -124,13 +120,16 @@ async def _read_exact_async(inp: AsyncReader, n: int) -> bytes:
     return bytes(buf)
 
 
-def _read_chunk(inp: AsyncReader) -> bytes:
-    raise RuntimeError("Use _read_chunk_async")
-
 async def _read_chunk_async(inp: AsyncReader) -> bytes:
     """Read one length-prefixed ciphertext chunk from *inp*."""
     raw_len = await _read_exact_async(inp, CHUNK_LEN_SIZE)
     chunk_len = unpack_chunk_len(raw_len)
+    # C2: Bounds check to prevent OOM amplification attack
+    if chunk_len > MAX_CHUNK_SIZE:
+        raise ProtocolError(
+            f"Chunk size {chunk_len} exceeds maximum {MAX_CHUNK_SIZE}. "
+            "Possible amplification attack."
+        )
     return await _read_exact_async(inp, chunk_len)
 
 
@@ -210,6 +209,7 @@ async def send_file_v1(
     out: AsyncWriter,
     ttl_seconds: int = 300,
     chunk_size: int = CHUNK_SIZE,
+    pqc_psk: str | None = None,
 ) -> None:
     """
     Encrypt and send a file using the V1 (Peer-to-Peer) protocol.
@@ -219,7 +219,7 @@ async def send_file_v1(
     stream_salt = os.urandom(24)
 
     stream_key = derive_stream_key(
-        identity.x25519_privkey, receiver_pubkey_x25519, stream_salt
+        identity.x25519_privkey, receiver_pubkey_x25519, stream_salt, pqc_psk=pqc_psk
     )
     pusher = SecretstreamPusher(stream_key)
 
@@ -245,9 +245,8 @@ async def send_file_v1(
     h = hashlib.sha256()
     async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
-            chunk = b'\x00' * chunk_size
-            h.update(chunk)
-            await _write_chunk_async(out, pusher.push(chunk))
+            await _write_chunk_async(out, pusher.push_final(b''))
+            return
         else:
             while True:
                 chunk = await f.read(chunk_size)
@@ -276,6 +275,7 @@ async def send_file_v2(
     out: AsyncWriter,
     ttl_seconds: int = 300,
     chunk_size: int = CHUNK_SIZE,
+    pqc_psk: str | None = None,
 ) -> None:
     """
     Encrypt and send a file using the V2 (Forward Secrecy / Server-Assisted) protocol.
@@ -285,7 +285,7 @@ async def send_file_v2(
     stream_salt = os.urandom(24)
 
     ephemeral_priv, ephemeral_pub = generate_ephemeral_keypair()
-    stream_key = derive_stream_key(ephemeral_priv, receiver_prekey_pubkey, stream_salt)
+    stream_key = derive_stream_key(ephemeral_priv, receiver_prekey_pubkey, stream_salt, pqc_psk=pqc_psk)
     pusher = SecretstreamPusher(stream_key)
 
     prekey_id_bytes = receiver_prekey_id.encode('ascii')
@@ -319,9 +319,8 @@ async def send_file_v2(
     h = hashlib.sha256()
     async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
-            chunk = b'\x00' * chunk_size
-            h.update(chunk)
-            await _write_chunk_async(out, pusher.push(chunk))
+            await _write_chunk_async(out, pusher.push_final(b''))
+            return
         else:
             while True:
                 chunk = await f.read(chunk_size)
@@ -349,6 +348,7 @@ async def receive_file(
     inp: AsyncReader,
     dest_path: Path | str,
     nonce_cache: NonceCache,
+    pqc_psk: str | None = None,
 ) -> None:
     """
     Dynamically read the version byte and route to the correct receiver.
@@ -361,9 +361,9 @@ async def receive_file(
     (version,) = struct.unpack(">B", version_byte)
     
     if version == PROTOCOL_VERSION_V1:
-        await _receive_v1(identity, keystore, inp, dest_path, nonce_cache)
+        await _receive_v1(identity, keystore, inp, out_dir, nonce_cache, pqc_psk)
     elif version == PROTOCOL_VERSION_V2:
-        await _receive_v2(identity, keystore, keystore_dir, identity_name, inp, dest_path, nonce_cache)
+        await _receive_v2(identity, keystore, keystore_dir, identity_name, inp, out_dir, nonce_cache, pqc_psk)
     else:
         raise VersionError(
             f"Unsupported protocol version: 0x{version:02x}"
@@ -374,11 +374,11 @@ async def _receive_v1(
     identity: LocalIdentity,
     keystore: Keystore,
     inp: AsyncReader,
-    dest_path: Path | str,
+    out_dir: Path | str,
     nonce_cache: NonceCache,
+    pqc_psk: str | None = None,
 ) -> None:
-    dest_path = Path(dest_path)
-    part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+    out_dir = Path(out_dir)
 
     try:
         raw_preamble = await _read_exact_async(inp, PREAMBLE_SIZE_V1)
@@ -393,11 +393,11 @@ async def _receive_v1(
     peer = keystore.get(preamble.sender_key_id)
 
     stream_key = derive_stream_key(
-        identity.x25519_privkey, peer.x25519, preamble.stream_salt
+        identity.x25519_privkey, peer.x25519, preamble.stream_salt, pqc_psk=pqc_psk
     )
     puller = SecretstreamPuller(stream_key, preamble.stream_header)
     
-    await _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
+    await _process_payload(peer, puller, inp, out_dir, nonce_cache, preamble.sender_key_id)
 
 
 async def _receive_v2(
@@ -406,11 +406,11 @@ async def _receive_v2(
     keystore_dir: Path | str,
     identity_name: str,
     inp: AsyncReader,
-    dest_path: Path | str,
+    out_dir: Path | str,
     nonce_cache: NonceCache,
+    pqc_psk: str | None = None,
 ) -> None:
-    dest_path = Path(dest_path)
-    part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+    out_dir = Path(out_dir)
 
     try:
         raw_preamble = await _read_exact_async(inp, PREAMBLE_SIZE_V2)
@@ -438,18 +438,17 @@ async def _receive_v2(
         raise PreKeyConsumedError(f"Pre-Key {prekey_id} does not exist or was already consumed")
 
     stream_key = derive_stream_key(
-        prekey_priv, preamble.ephemeral_pub, preamble.stream_salt
+        prekey_priv, preamble.ephemeral_pub, preamble.stream_salt, pqc_psk=pqc_psk
     )
     puller = SecretstreamPuller(stream_key, preamble.stream_header)
-    await _process_payload(peer, puller, inp, part_path, dest_path, nonce_cache, preamble.sender_key_id)
+    await _process_payload(peer, puller, inp, out_dir, nonce_cache, preamble.sender_key_id)
 
 
 async def _process_payload(
     peer, 
     puller, 
     inp: AsyncReader, 
-    part_path, 
-    dest_path, 
+    out_dir: Path, 
     nonce_cache, 
     sender_key_id
 ):
@@ -470,6 +469,23 @@ async def _process_payload(
     transfer_nonce = meta.transfer_nonce
     timestamp = meta.timestamp
     ttl = meta.ttl
+    
+    # C3: Cap server-side TTL at 3600s max to prevent unbounded nonce cache growth
+    MAX_TTL_SECONDS = 3600
+    if ttl > MAX_TTL_SECONDS:
+        ttl = MAX_TTL_SECONDS
+        
+    # A11: Use sanitised meta.filename for received files
+    safe_name = Path(meta.filename).name
+    if not safe_name or safe_name in ('.', '..'):
+        safe_name = "received_file"
+    dest_path = out_dir / safe_name
+    counter = 1
+    while dest_path.exists():
+        dest_path = out_dir / f"{safe_name}.{counter}"
+        counter += 1
+    part_path = dest_path.with_suffix(".part")
+
 
     now = time.time()
     if now - timestamp > ttl:

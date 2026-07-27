@@ -31,6 +31,11 @@ class SecXferClient:
         if len(self.keystore) == 0:
             logger.warning(f"No .pub files found in {self.keystore_dir}. Transfers from any sender will be rejected.")
 
+    def refresh_keystore(self):
+        """Reload all .pub files from disk into the in-memory keystore."""
+        self.keystore = Keystore.from_directory(self.keystore_dir)
+        logger.info(f"Keystore refreshed: {len(self.keystore)} peer(s) loaded from {self.keystore_dir}")
+
     async def send(
         self,
         receiver_name: str,
@@ -38,6 +43,7 @@ class SecXferClient:
         out_stream: AsyncWriter,
         server_url: Optional[str] = None,
         ttl_seconds: int = 300,
+        pqc_psk: Optional[str] = None,
     ) -> None:
         """
         Sends a file. If server_url is provided, uses V2 Forward Secrecy.
@@ -88,6 +94,7 @@ class SecXferClient:
                 file_path,
                 out_stream,
                 ttl_seconds=ttl_seconds,
+                pqc_psk=pqc_psk,
             )
         else:
             # V1 (P2P mode)
@@ -107,12 +114,14 @@ class SecXferClient:
                 file_path,
                 out_stream,
                 ttl_seconds=ttl_seconds,
+                pqc_psk=pqc_psk,
             )
 
     async def receive(
         self,
         inp_stream: AsyncReader,
         dest_path: Path | str,
+        pqc_psk: Optional[str] = None,
     ) -> None:
         """
         Decrypt and verify a file from a binary stream.
@@ -126,7 +135,8 @@ class SecXferClient:
             self.identity_name, 
             inp_stream, 
             dest_path, 
-            self.nonce_cache
+            self.nonce_cache,
+            pqc_psk=pqc_psk
         )
 
 
@@ -151,8 +161,27 @@ class SecXferClient:
             "prekeys": prekeys
         }
 
+        def fetch_challenge():
+            req = urllib.request.Request(server_url.rstrip("/") + f"/challenge?key_id={self.identity.key_id.hex()}")
+            with urllib.request.urlopen(req) as response:
+                return json.loads(response.read().decode())
+
+        try:
+            challenge_data = await asyncio.to_thread(fetch_challenge)
+            nonce_hex = challenge_data["nonce"]
+        except Exception as exc:
+            raise ProtocolError(f"Failed to fetch PoP challenge from server: {exc}")
+
+        # Sign the nonce with Ed25519 seed (private key)
+        from nacl.signing import SigningKey
+        sk = SigningKey(self.identity.ed25519_seed)
+        signature = sk.sign(bytes.fromhex(nonce_hex)).signature
+        
+        payload["challenge_nonce"] = nonce_hex
+        payload["signature"] = signature.hex()
+
         req = urllib.request.Request(
-            server_url.rstrip("/") + "/upload",
+            server_url.rstrip("/") + "/register",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}
         )
@@ -163,7 +192,7 @@ class SecXferClient:
 
         try:
             data = await asyncio.to_thread(do_upload)
-            logger.info(f"Successfully uploaded keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
+            logger.info(f"Successfully registered keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
             return data
         except Exception as exc:
-            raise ProtocolError(f"Failed to upload keys to server: {exc}")
+            raise ProtocolError(f"Failed to register keys to server: {exc}")

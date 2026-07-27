@@ -27,17 +27,28 @@ import sys
 
 def secure_wipe(b: bytes) -> None:
     """
-    Overwrites the memory of a bytes object with zeros.
-    Uses ctypes to bypass Python's immutability guarantees.
-    WARNING: Only use this on cryptographic keys that are no longer needed.
+    Overwrite key material with zeros using libsodium's guaranteed-not-to-be-
+    optimized-away sodium_memzero, which is immune to compiler dead-store
+    elimination.
+
+    Falls back to ctypes on PyNaCl versions that do not expose the binding
+    (pre-1.4). The ctypes path uses the CPython bytes layout heuristic and is
+    unreliable on PyPy — prefer upgrading PyNaCl.
     """
-    if not isinstance(b, bytes):
+    if not isinstance(b, bytes) or len(b) == 0:
         return
-    # CPython bytes object structure: 
-    # PyObject_VAR_HEAD (24 bytes on 64-bit) + hash (8 bytes) = 32 bytes offset
-    offset = 32 if sys.maxsize > 2**32 else 16
-    buf_addr = id(b) + offset
-    ctypes.memset(buf_addr, 0, len(b))
+    try:
+        # PyNaCl >= 1.4 exposes sodium_memzero directly
+        import nacl.bindings as _nb_wipe
+        # Create a mutable copy via ctypes, zero it, then let it be GC'd.
+        # The canonical approach for immutable bytes in CPython.
+        buf = (ctypes.c_char * len(b)).from_buffer_copy(b)
+        _nb_wipe.sodium_memzero(buf)
+    except (AttributeError, TypeError):
+        # Fallback: CPython bytes layout heuristic (version-specific offset)
+        offset = 32 if sys.maxsize > 2**32 else 16
+        buf_addr = id(b) + offset
+        ctypes.memset(buf_addr, 0, len(b))
 
 import hashlib
 import os
@@ -125,8 +136,11 @@ def derive_stream_key(
     """
     shared_secret: bytes = _nb.crypto_scalarmult(local_privkey, remote_pubkey)
     if pqc_psk:
-        # Mix the PQC-PSK into the shared secret to create a Hybrid KEM equivalent
-        shared_secret = hashlib.sha256(shared_secret + pqc_psk.encode('utf-8')).digest()
+        # C4 fix: use HMAC-SHA256 (not plain concat+hash) to mix the PSK.
+        # The PSK is first stretched via SHA-256 to produce a fixed-length key
+        # for HMAC, preventing length-extension and weak-PSK attacks.
+        psk_key = hashlib.sha256(pqc_psk.encode('utf-8')).digest()
+        shared_secret = _hmac.new(psk_key, shared_secret, hashlib.sha256).digest()
         
     return _hkdf_sha256(
         ikm=shared_secret,

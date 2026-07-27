@@ -18,6 +18,22 @@ def _load_id(path):
             except WrongPasswordError:
                 print("Incorrect password. Please try again.", file=sys.stderr)
 
+def _cmd_ui(args: argparse.Namespace) -> None:
+    import uvicorn
+    from secxfer.ui.app import app
+    from pathlib import Path
+    
+    keystore = Path(args.keystore) if hasattr(args, 'keystore') and args.keystore else Path("./keys")
+    keystore.mkdir(parents=True, exist_ok=True)
+    
+    app.state.identity_name = args.identity if hasattr(args, 'identity') else "identity"
+    app.state.keystore_dir = keystore
+    app.state.use_tor = args.tor if hasattr(args, 'tor') else False
+    app.state.pqc_psk = args.pqc_psk if hasattr(args, 'pqc_psk') else None
+    
+    print(f"\n[*] Starting SecXfer Web UI Dashboard on http://localhost:{args.port} ...")
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
+
 def _cmd_qr_show(args: argparse.Namespace) -> None:
     import segno
     
@@ -213,7 +229,7 @@ def _cmd_pin(args: argparse.Namespace) -> None:
     keystore_dir = Path(args.keystore)
     keystore_dir.mkdir(parents=True, exist_ok=True)
     
-pub_path = keystore_dir / f"{args.name}.pub"
+    pub_path = keystore_dir / f"{args.name}.pub"
     if pub_path.exists():
         existing_pubkey_hex = pub_path.read_bytes().hex()
         if existing_pubkey_hex != identity_pubkey_hex:
@@ -432,6 +448,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read encrypted input from FILE instead of stdin"
     )
     p_recv.set_defaults(func=_cmd_receive)
+
+    # UI Command
+    p_ui = sub.add_parser("ui", help="start the SecXfer local web dashboard")
+    p_ui.add_argument("--port", type=int, default=8085, help="port for the web UI")
+    p_ui.add_argument("--identity", default="identity", metavar="NAME", help="identity name (default: identity)")
+    p_ui.add_argument("--keystore", default="./keys", metavar="DIR", help="keystore directory (default: ./keys)")
+    p_ui.add_argument("--tor", action="store_true", help="route UI backend traffic over Tor")
+    p_ui.add_argument("--pqc-psk", metavar="PSK", default=None, help="post-quantum pre-shared key")
+    p_ui.set_defaults(func=_cmd_ui)
 
     return parser
 

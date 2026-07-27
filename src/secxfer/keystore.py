@@ -55,7 +55,7 @@ class UnknownSenderError(Exception):
 
 _PUBKEY_SIZE = 64   # x25519_pubkey (32) || ed25519_pubkey (32)
 _PRIVKEY_SIZE = 64  # x25519_privkey (32) || ed25519_seed (32)
-_KEY_ID_LEN = 8     # first 8 bytes of SHA-256(x25519_pubkey)
+_KEY_ID_LEN = 16    # first 16 bytes of SHA-256(x25519_pubkey) — 128-bit collision resistance
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +225,6 @@ def generate_keypair(output_dir: Path | str, name: str = "identity", num_prekeys
         from secxfer.crypto import encrypt_private_key
         fake_priv_bytes = None
         if duress_password:
-            import os
-            from nacl.signing import SigningKey
-            import nacl.bindings as _nb
             fake_x25519_priv = os.urandom(32)
             fake_signing_key = SigningKey.generate()
             fake_ed25519_seed = bytes(fake_signing_key)

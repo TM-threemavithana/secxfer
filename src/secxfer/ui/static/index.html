@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecXfer Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="overlay"></div>
+    <div class="container">
+        <header>
+            <h1><span class="glitch" data-text="SECXFER">SECXFER</span> <span class="badge">v1.0</span></h1>
+            <p class="subtitle">Quantum-Resistant Secure File Transfer</p>
+        </header>
+
+        <div id="status-panel" class="panel glass">
+            <h2>System Status</h2>
+            <div class="status-grid">
+                <div class="status-item">
+                    <span class="label">Identity:</span>
+                    <span id="status-identity" class="value offline">Not Found</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Key ID:</span>
+                    <span id="status-keyid" class="value">---</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="unlock-panel" class="panel glass hidden">
+            <h2>Unlock Keystore</h2>
+            <form id="unlock-form">
+                <input type="password" id="unlock-password" placeholder="Real Password (or Duress)">
+                <button type="submit" class="btn primary">Decrypt & Unlock</button>
+            </form>
+        </div>
+
+        <div id="keygen-panel" class="panel glass hidden">
+            <h2>Generate New Identity</h2>
+            <form id="keygen-form">
+                <input type="password" id="keygen-password" placeholder="Real Password (Optional)">
+                <input type="password" id="keygen-duress" placeholder="Duress Password (Optional)">
+                <input type="text" id="keygen-entropy" placeholder="Mash Keyboard for Entropy (Optional)">
+                <button type="submit" class="btn primary">Generate Keys</button>
+            </form>
+        </div>
+
+        <div id="action-panel" class="panel glass hidden">
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('register')">Register</button>
+                <button class="tab" onclick="switchTab('send')">Send File</button>
+                <button class="tab" onclick="switchTab('receive')">Receive File</button>
+            </div>
+
+            <div id="tab-register" class="tab-content active">
+                <h3>Register with Directory</h3>
+                <p>Upload your public prekeys to the Key Directory server so others can send you files.</p>
+                <form id="register-form">
+                    <input type="text" id="register-server" placeholder="Server URL" value="http://127.0.0.1:54321" required>
+                    <button type="submit" id="btn-register" class="btn primary">Register Identity</button>
+                </form>
+            </div>
+
+            <div id="tab-send" class="tab-content hidden">
+                <h3>Send File (P2P)</h3>
+                <form id="send-form">
+                    <input type="text" id="send-target" placeholder="Target Pubkey Path (e.g. ./bob_keys/bob.pub)" required>
+                    <div style="display:flex;gap:8px;">
+                        <input type="text" id="send-host" placeholder="Target Host (default: 127.0.0.1)" value="127.0.0.1" style="flex:2">
+                        <input type="number" id="send-port" placeholder="Port" value="9090" style="flex:1">
+                    </div>
+                    <input type="password" id="send-pqc" placeholder="PQC Pre-Shared Key (Optional)">
+                    <div class="file-drop" id="file-drop">
+                        <input type="file" id="send-file" required>
+                        <p>Drag &amp; Drop file here or click to select</p>
+                    </div>
+                    <button type="submit" class="btn primary">Encrypt &amp; Send</button>
+                </form>
+            </div>
+
+            <div id="tab-receive" class="tab-content hidden">
+                <h3>Receive File (P2P)</h3>
+                <form id="receive-form">
+                    <input type="number" id="receive-port" placeholder="Port (Default: 9090)" value="9090">
+                    <input type="password" id="receive-pqc" placeholder="PQC Pre-Shared Key (Optional)">
+                    <button type="submit" class="btn primary">Listen for Transfer</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="log-panel" class="panel glass">
+            <h2>Terminal Log</h2>
+            <div id="logs" class="terminal-logs"></div>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

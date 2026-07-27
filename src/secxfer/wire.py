@@ -1,14 +1,14 @@
-﻿import struct
+import struct
 from dataclasses import dataclass
 from typing import BinaryIO
 
 PROTOCOL_VERSION_V1: int = 0x01
 PROTOCOL_VERSION_V2: int = 0x02
 
-_PREAMBLE_FMT_V1: str = ">8s24s24s" # (version byte read separately)
+_PREAMBLE_FMT_V1: str = ">16s24s24s" # (version byte read separately)
 PREAMBLE_SIZE_V1: int = struct.calcsize(_PREAMBLE_FMT_V1)
 
-_PREAMBLE_FMT_V2: str = ">8s16s32s64s24s24s" # (version byte read separately)
+_PREAMBLE_FMT_V2: str = ">16s16s32s64s24s24s" # (version byte read separately)
 PREAMBLE_SIZE_V2: int = struct.calcsize(_PREAMBLE_FMT_V2)
 
 _CHUNK_LEN_FMT: str = ">I"                             # uint32 big-endian

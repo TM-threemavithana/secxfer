@@ -26,6 +26,8 @@ server = [
     "uvicorn[standard]>=0.23.0",
     "sqlalchemy>=2.0.0",
     "httpx[socks]>=0.24.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
     "slowapi>=0.1.9",
 ]
 ux = [
