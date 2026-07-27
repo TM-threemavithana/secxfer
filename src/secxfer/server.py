@@ -127,16 +127,23 @@ class KDCRequestHandler(BaseHTTPRequestHandler):
                         return
                     user_id, identity_pubkey = user_row
                     cursor.execute(
+                        'SELECT COUNT(*) FROM prekeys WHERE user_id = ? AND used = 0', (user_id,)
+                    )
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        self._send_error(404, "Pre-keys exhausted. User must re-register.")
+                        return
+
+                    cursor.execute(
                         'SELECT id, prekey_id, prekey_pubkey FROM prekeys '
                         'WHERE user_id = ? AND used = 0 LIMIT 1', (user_id,)
                     )
-                    pk_row = cursor.fetchone()
-                    if not pk_row:
-                        self._send_error(404, "Pre-keys exhausted. User must re-register.")
-                        return
-                    pk_db_id, prekey_id, prekey_pubkey = pk_row
-                    cursor.execute('UPDATE prekeys SET used = 1 WHERE id = ?', (pk_db_id,))
-                    conn.commit()
+                    pk_db_id, prekey_id, prekey_pubkey = cursor.fetchone()
+                    
+                    if count > 1:
+                        cursor.execute('UPDATE prekeys SET used = 1 WHERE id = ?', (pk_db_id,))
+                        conn.commit()
+
                     self._send_json(200, {
                         "identity_pubkey": identity_pubkey,
                         "prekey": {"id": prekey_id, "pubkey": prekey_pubkey}

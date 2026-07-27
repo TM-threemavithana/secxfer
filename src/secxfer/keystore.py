@@ -281,11 +281,22 @@ def consume_prekey(output_dir: Path | str, name: str, prekey_id: str) -> bytes:
     """
     Atomically consumes a pre-key.
     Uses os.rename to ensure thread/process safe check-and-delete.
+    If it is the very last pre-key for the identity, it acts as a Last Resort
+    Pre-Key and is NOT consumed, mitigating X3DH exhaustion attacks.
     Returns the 32-byte private key.
     Raises FileNotFoundError if the pre-key does not exist or was already consumed.
     """
     prekeys_dir = Path(output_dir) / f"{name}_prekeys"
     pk_path = prekeys_dir / f"{prekey_id}.key"
+    
+    # Is this the last remaining pre-key?
+    all_keys = list(prekeys_dir.glob("*.key"))
+    is_last = (len(all_keys) <= 1)
+    
+    if is_last and pk_path.exists():
+        # Do not consume the last resort pre-key
+        return pk_path.read_bytes()
+    
     consumed_path = prekeys_dir / f"{prekey_id}.key.used"
     
     # Atomic TOCTOU-safe consumption

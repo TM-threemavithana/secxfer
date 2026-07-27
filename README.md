@@ -1,176 +1,88 @@
-# secxfer
+# SecXfer
 
-Cryptographically secure file transfer library using pre-shared keys.
+**SecXfer** is a cryptographically secure, forward-secret, and quantum-resistant (hybrid) file transfer system. It consists of a modern web UI, a robust CLI, and a central Key Directory server.
 
-See [`threat_model.md`](threat_model.md) and [`protocol_flow.md`](protocol_flow.md) for full design rationale.
+## Features
 
-## Security properties
+- **X3DH Key Exchange:** Perfect Forward Secrecy using Extended Triple Diffie-Hellman (X3DH). Even if long-term private keys are compromised, past transfers remain secure.
+- **Hybrid Post-Quantum Security:** Optional Pre-Shared Keys (PQC-PSK) mixed securely via `HMAC-SHA256` to protect against future quantum adversaries ("Harvest Now, Decrypt Later" attacks).
+- **Modern Web UI:** Launch a local web dashboard (`secxfer ui`) to easily manage identities, register with the directory, and send/receive files seamlessly.
+- **Robust Attack Defenses:**
+  - **Replay Protection:** Persistent SQLite-backed nonce cache with server-capped TTLs to prevent unbounded memory/disk growth.
+  - **Memory Exhaustion DoS:** Strict bounds-checking on file chunk sizes.
+  - **Impersonation Protection:** Ed25519 Proof-of-Possession (PoP) challenge-response during key registration.
+  - **Secure Wipe:** In-memory sensitive material is purged using libsodium's `sodium_memzero`.
+  - **Pre-Key Exhaustion Mitigation:** Automatically degrades to a "Last Resort Pre-Key" to prevent Denial of Service (DoS) attacks on the key directory.
+  - **Key Encryption:** Private keys are protected on-disk using `Argon2i`.
+
+## Security Properties
 
 | Property | Status |
 |---|---|
 | Confidentiality | ✅ XChaCha20-Poly1305 (secretstream) |
 | Integrity | ✅ AEAD per-chunk; Ed25519 over whole-file SHA-256 |
-| Authentication | ✅ Sender is verified against pre-shared public key |
-| Replay protection | ✅ Seen-nonce cache (in-memory, TTL-bounded) |
-| Ordering/truncation | ✅ secretstream TAG_FINAL; truncated stream → error |
-| Forward secrecy | ❌ Static keys; no forward secrecy (documented in threat model §5) |
-| Key distribution | ❌ Out of scope; keys must be exchanged out-of-band |
+| Authentication | ✅ Sender is mathematically verified against registered keys |
+| Replay protection | ✅ Persistent SQLite nonce cache (TTL-bounded, DoS-resistant) |
+| Forward secrecy | ✅ X3DH protocol with dynamic pre-keys |
+| Key distribution | ✅ Centralized Key Directory Server (`server.py`) with PoP |
 
 ## Stack
 
-- Python 3.11+
-- [PyNaCl](https://pynacl.readthedocs.io/) (libsodium bindings)
-- Primitives: X25519 + HKDF-SHA256, XChaCha20-Poly1305 (secretstream), Ed25519
-- Zero runtime dependencies beyond PyNaCl
+- **Core:** Python 3.11+
+- **Cryptography:** `PyNaCl` (libsodium bindings) + X25519, XChaCha20-Poly1305, Ed25519, Argon2i
+- **Web UI & Server:** `FastAPI`, `Uvicorn`, HTML/CSS/JS (Vanilla)
+- **Database:** `sqlite3`
 
-## Install
+## Quick Start
 
-```
-pip install -e ".[dev]"
-```
+### 1. Start the Key Directory Server
 
-## Quick start
-
-### 1. Generate keypairs
-
-Each party generates their own keypair. Private keys never leave their machine.
-
-```
-secxfer keygen --dir ./alice-keys
-secxfer keygen --dir ./bob-keys
+The central server hosts public pre-keys for X3DH to allow offline file transfers.
+```bash
+python -m secxfer.server
+# Server listens on http://127.0.0.1:54321
 ```
 
-Output:
-```
-Generated keypair in C:\...\alice-keys\
-  Private key : alice-keys\identity.key  (keep secret)
-  Public key  : alice-keys\identity.pub  (share with peers)
-  Key ID      : a3f2c7d1b09e4512
-```
+### 2. Launch the Web UI
 
-### 2. Exchange public keys (out-of-band)
-
-Copy `.pub` files over any trusted channel (USB, secure email, etc.):
-
-```
-copy alice-keys\identity.pub bob-keys\alice.pub
-copy bob-keys\identity.pub   alice-keys\bob.pub
+Launch a local dashboard for a user (e.g., Alice).
+```bash
+secxfer ui --identity alice --keystore ./alice_keys --port 8085
 ```
 
-The keystore directory for each party is the directory containing their
-trusted peers' `.pub` files.
+### 3. Generate & Register an Identity
+1. Open `http://127.0.0.1:8085` in your browser.
+2. In the **Identity** tab, generate a new identity and set a strong Argon2 password.
+3. In the **Register** tab, register your identity with the Directory Server (`http://127.0.0.1:54321`). This securely uploads your X3DH pre-keys using an Ed25519 PoP handshake.
 
-### 3. Send a file
+### 4. Transfer Files
+1. Alice and Bob both launch their `secxfer ui` processes (on different ports).
+2. Bob registers his keys with the central directory.
+3. Alice enters Bob's Key ID in the **Send** tab, selects a file, and points it to Bob's receiving host/port (e.g., `127.0.0.1:8086`).
+4. Bob receives the file securely in his `keystore/downloads` folder.
 
-```
-secxfer send secret.txt ^
-    --identity alice-keys\identity.key ^
-    --to alice-keys\bob.pub ^
-    --out transfer.bin
-```
+## Protocol Versions
+SecXfer supports two wire protocols seamlessly:
+- **V1:** Static pre-shared keys (Out-of-band key exchange, no forward secrecy).
+- **V2 (Default):** X3DH key exchange (Centralized directory, perfect forward secrecy).
 
-Or pipe directly:
+## Module Architecture
 
-```
-secxfer send secret.txt --identity alice-keys\identity.key --to alice-keys\bob.pub | ^
-    secxfer receive received.txt --identity bob-keys\identity.key --keystore bob-keys
-```
-
-### 4. Receive a file
-
-```
-secxfer receive received.txt ^
-    --identity bob-keys\identity.key ^
-    --keystore bob-keys ^
-    --in transfer.bin
-```
-
-`received.txt` is created only after all authentication and signature checks pass.
-Partial or unauthenticated output is never written to the destination path.
-
-## CLI reference
-
-```
-secxfer keygen  --dir DIR [--name NAME]
-secxfer show-id --identity KEY
-secxfer send    FILE --identity KEY --to PUBKEY [--ttl SECS] [--out FILE]
-secxfer receive DEST --identity KEY --keystore DIR [--in FILE]
+```text
+src/secxfer/
+├── ui/              ← FastAPI dashboard and HTML/JS frontend
+├── server.py        ← Central Key Directory (X3DH pre-key distribution)
+├── client.py        ← High-level SDK (UI backend bridge)
+├── transfer.py      ← V1/V2 Wire protocol, chunk handling, NonceCache
+├── keystore.py      ← Key lifecycle, Argon2i encryption, Last Resort Pre-Keys
+├── crypto.py        ← Primitives (X25519, HKDF, secretstream, sodium_memzero)
+└── wire.py          ← Binary protocol framing and padding
 ```
 
-| Flag | Description |
-|---|---|
-| `--dir` | Directory to write key files |
-| `--name` | Key file base name (default: `identity`) |
-| `--identity` | Path to your `.key` file |
-| `--to` | Path to the receiver's `.pub` file |
-| `--keystore` | Directory containing trusted sender `.pub` files |
-| `--ttl` | Transfer time-to-live in seconds (default: 300) |
-| `--out` | Write encrypted output to a file (default: stdout) |
-| `--in` | Read encrypted input from a file (default: stdin) |
+## Running Tests
 
-## Wire format (summary)
-
-```
-Preamble (57 bytes, unauthenticated):
-  version       : 1 byte  (0x01)
-  sender_key_id : 8 bytes (first 8 of SHA-256(x25519_pubkey))
-  stream_salt   : 24 bytes (HKDF salt; fresh per transfer)
-  stream_header : 24 bytes (secretstream init_push output)
-
-Chunk 0 — metadata (AEAD-protected, TAG_MESSAGE):
-  transfer_nonce, timestamp, ttl, filename, file_size
-
-Chunks 1..N — file data (AEAD-protected, TAG_MESSAGE)
-
-Chunk N+1 — trailer (AEAD-protected, TAG_FINAL):
-  Ed25519 signature (64 bytes)
-```
-
-Each chunk is length-prefixed (4-byte big-endian uint32 before the ciphertext).
-
-## Module architecture
-
-```
-cli.py          ← argument parsing only; no business logic
-  └── transfer.py  ← state machines, nonce cache, .part lifecycle
-        ├── crypto.py    ← stateless primitives (X25519, HKDF, secretstream, Ed25519)
-        └── keystore.py  ← key lookup, key generation, key loading
-```
-
-Strict dependency DAG: `cli → transfer → {crypto, keystore}`. `crypto` and
-`keystore` do not import from each other or from `transfer`.
-
-## Known limitations
-
-1. **No forward secrecy.** Static pre-shared keys mean the shared secret
-   `X25519(alice_priv, bob_pub)` is the same for every transfer between a pair.
-   Compromise of either party's private key exposes all past transfers.
-
-2. **In-memory nonce cache.** Replay protection resets on process restart.
-   A long-running receiver service should persist the cache externally.
-
-3. **No cross-process replay protection.** Each process has its own `NonceCache`
-   instance in its own memory space.  Two receiver processes do not share the
-   same cache, so a replay sent to a second process is not rejected.  This is
-   not a thread-safety issue (within a single process, `NonceCache` is
-   protected by a `threading.Lock`); it is a "no shared state exists" issue.
-   Fix by using an external store (e.g. Redis) as the nonce cache backend.
-
-4. **Local file permissions.** The `identity.key` file is written using
-   `chmod 600` on a best-effort basis. However, effective isolation relies
-   on the host operating system (POSIX permissions or Windows ACLs). If
-   a compromised or malicious process runs under the same user account,
-   or if OS-level isolation fails, the private key can be stolen. A stolen
-   private key compromises all future transfers (no forward secrecy) and
-   allows the attacker to forge signatures.
-
-## Test
-
-```
+SecXfer includes comprehensive cryptographic unit tests and integration tests covering malicious network traffic, truncation, and forgery:
+```bash
 pytest
-pytest --tb=short -q   # compact output
-pytest tests/test_crypto.py -v   # crypto layer only
+pytest tests/test_crypto_v1.py -v   # Run specific test suite
 ```
-
-51 tests covering happy paths and named negative tests for every attack
-in the threat model's §6.

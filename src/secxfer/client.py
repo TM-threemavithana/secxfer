@@ -65,7 +65,7 @@ class SecXferClient:
             req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_key_id.hex())
 
             def fetch_keys():
-                with urllib.request.urlopen(req) as response:
+                with urllib.request.urlopen(req, timeout=10.0) as response:
                     return json.loads(response.read().decode())
 
             try:
@@ -163,7 +163,7 @@ class SecXferClient:
 
         def fetch_challenge():
             req = urllib.request.Request(server_url.rstrip("/") + f"/challenge?key_id={self.identity.key_id.hex()}")
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=10.0) as response:
                 return json.loads(response.read().decode())
 
         try:
@@ -187,7 +187,7 @@ class SecXferClient:
         )
 
         def do_upload():
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=10.0) as response:
                 return json.loads(response.read().decode())
 
         try:
