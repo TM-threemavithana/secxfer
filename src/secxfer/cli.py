@@ -29,7 +29,6 @@ def _cmd_ui(args: argparse.Namespace) -> None:
     app.state.identity_name = args.identity if hasattr(args, 'identity') else "identity"
     app.state.keystore_dir = keystore
     app.state.use_tor = args.tor if hasattr(args, 'tor') else False
-    app.state.pqc_psk = args.pqc_psk if hasattr(args, 'pqc_psk') else None
     
     print(f"\n[*] Starting SecXfer Web UI Dashboard on http://localhost:{args.port} ...")
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
@@ -65,17 +64,8 @@ Commands
   secxfer keygen   --dir DIR [--name NAME]
   secxfer register --identity KEY --name NAME --server URL
   secxfer pin      --name NAME --server URL --keystore DIR
-  secxfer send     FILE --identity KEY --to DEST [--server URL] [--keystore DIR] [--ttl SECS] [--out FILE]
-  secxfer receive  DEST --identity KEY --name NAME --keystore DIR [--in FILE]
   secxfer show-id  --identity KEY
-
-Transport model
----------------
-send writes to stdout (or --out FILE); receive reads from stdin (or --in FILE).
-This makes the tool composable with standard Unix plumbing::
-
-    secxfer send secret.txt --identity alice.key --to bob.pub | \
-        secxfer receive out.txt --identity bob.key --name bob --keystore ./keys
+  secxfer ui       --port PORT
 """
 import logging
 from pathlib import Path
@@ -200,7 +190,7 @@ def _cmd_register(args: argparse.Namespace) -> None:
     keystore = Path(args.keystore) if getattr(args, "keystore", None) else Path(args.identity).parent / "keystore"
     keystore.mkdir(exist_ok=True)
     
-    client = _get_client(args.identity, keystore, use_tor=args.tor)
+    client = _get_client(args.identity, keystore, use_tor=getattr(args, 'tor', False))
     try:
         data = asyncio.run(client.upload_keys(args.server))
         print(f"Registered successfully! Added {data.get('prekeys_added')} prekeys.")
@@ -250,79 +240,7 @@ def _cmd_pin(args: argparse.Namespace) -> None:
         logging.info(f"Saved one-time pre-key {pk_id} for V2 transfers")
 
 
-def _cmd_send(args: argparse.Namespace) -> None:
-    """Encrypt and send a file to stdout (or --out FILE)."""
-    from secxfer.client import SecXferClient
-    import asyncio
-    
-    class AsyncFileWrapper:
-        def __init__(self, f):
-            self.f = f
-        async def write(self, data):
-            return await asyncio.to_thread(self.f.write, data)
-        async def close(self):
-            pass
-    
-    file_path = Path(args.file)
-    # Determine out stream
-    out_f = None
-    if args.out:
-        out_path = Path(args.out)
-        out_f = out_path.open("wb")
-    else:
-        out_f = sys.stdout.buffer
 
-    try:
-        # Default to identity's parent dir for keystore if not specified (for P2P mode)
-        keystore_dir = Path(args.keystore) if args.keystore else Path(args.identity).parent
-        client = _get_client(args.identity, keystore_dir, use_tor=args.tor)
-        
-        async def _run_send():
-            await client.send(
-                receiver_name=args.to,
-                file_path=file_path,
-                out_stream=AsyncFileWrapper(out_f),
-                server_url=args.server,
-                ttl_seconds=args.ttl
-            )
-        
-        asyncio.run(_run_send())
-            
-        if args.out:
-            logging.info(f"Sent: {file_path} → {out_path}")
-            
-    finally:
-        if args.out and out_f:
-            out_f.close()
-
-
-def _cmd_receive(args: argparse.Namespace) -> None:
-    """Decrypt and verify a file from stdin (or --in FILE) to DEST."""
-    from secxfer.client import SecXferClient
-    client = _get_client(args.identity, args.keystore, use_tor=args.tor)
-
-    dest_path = Path(args.dest)
-
-    import asyncio
-
-    class AsyncFileWrapper:
-        def __init__(self, f):
-            self.f = f
-        async def read(self, n=-1):
-            return await asyncio.to_thread(self.f.read, n)
-
-    async def _run_receive(inp_f):
-        await client.receive(AsyncFileWrapper(inp_f), dest_path)
-
-    if args.input:
-        inp_path = Path(args.input)
-        with inp_path.open("rb") as inp_f:
-            asyncio.run(_run_receive(inp_f))
-    else:
-        inp_stream = sys.stdin.buffer
-        asyncio.run(_run_receive(inp_stream))
-
-    logging.info(f"Received: → {dest_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -404,49 +322,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_qr_show.add_argument("--identity", required=True, metavar="KEY")
     p_qr_show.set_defaults(func=_cmd_qr_show)
 
-    # ── send ────────────────────────────────────────────────────────────────
-    p_send = sub.add_parser(
-        "send",
-        help="encrypt and send a file (writes to stdout or --out FILE)",
-        description=(
-            "Encrypts FILE using the receiver's pre-key from the server.\n"
-            "Output goes to stdout by default (pipe to receiver) or to --out FILE."
-        ),
-    )
-    p_send.add_argument("file", metavar="FILE", help="plaintext file to send")
-    p_send.add_argument("--identity", required=True, metavar="KEY", help="sender's .key file")
-    p_send.add_argument("--to", required=True, metavar="NAME", help="receiver's name (V2) or path to .pub file (V1)")
-    p_send.add_argument("--server", default=None, metavar="URL", help="key server URL (triggers V2 Forward Secrecy mode)")
-    p_send.add_argument("--keystore", default=None, metavar="DIR", help="pinned keystore directory (required for V2)")
-    p_send.add_argument("--ttl", type=int, default=300, metavar="SECS")
-    p_send.add_argument("--out", metavar="FILE", default=None)
-    p_send.set_defaults(func=_cmd_send)
 
-    # ── receive ─────────────────────────────────────────────────────────────
-    p_recv = sub.add_parser(
-        "receive",
-        help="decrypt and verify a file (reads from stdin or --in FILE)",
-        description=(
-            "Decrypts and verifies a transfer from stdin (or --in FILE),\n"
-            "writing the plaintext to DEST only after all authentication\n"
-            "checks pass.  DEST is never created in a partial state."
-        ),
-    )
-    p_recv.add_argument("dest", metavar="DEST", help="destination file path")
-    p_recv.add_argument(
-        "--identity", required=True, metavar="KEY",
-        help="receiver's .key file"
-    )
-
-    p_recv.add_argument(
-        "--keystore", required=True, metavar="DIR",
-        help="directory containing trusted sender .pub files"
-    )
-    p_recv.add_argument(
-        "--in", dest="input", metavar="FILE", default=None,
-        help="read encrypted input from FILE instead of stdin"
-    )
-    p_recv.set_defaults(func=_cmd_receive)
 
     # UI Command
     p_ui = sub.add_parser("ui", help="start the SecXfer local web dashboard")
@@ -454,7 +330,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--identity", default="identity", metavar="NAME", help="identity name (default: identity)")
     p_ui.add_argument("--keystore", default="./keys", metavar="DIR", help="keystore directory (default: ./keys)")
     p_ui.add_argument("--tor", action="store_true", help="route UI backend traffic over Tor")
-    p_ui.add_argument("--pqc-psk", metavar="PSK", default=None, help="post-quantum pre-shared key")
     p_ui.set_defaults(func=_cmd_ui)
 
     return parser

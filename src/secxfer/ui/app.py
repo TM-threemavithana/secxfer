@@ -24,7 +24,6 @@ app.add_middleware(
 app.state.identity_name = "identity"
 app.state.keystore_dir = Path("./keys")
 app.state.use_tor = False
-app.state.pqc_psk = None
 app.state.client = None
 
 def get_client() -> SecXferClient:
@@ -84,7 +83,6 @@ async def register(server_url: str = Form("http://127.0.0.1:54321")):
 async def send_file(
     target_key_id: str = Form(...),
     file: UploadFile = File(...),
-    pqc_psk: str = Form(None),
     server_url: str = Form("http://127.0.0.1:54321")
 ):
     client = get_client()
@@ -95,7 +93,7 @@ async def send_file(
         shutil.copyfileobj(file.file, buffer)
     
     try:
-        await client.send(target_key_id, file_path, server_url, pqc_psk=pqc_psk or app.state.pqc_psk)
+        await client.send(target_key_id, file_path, server_url)
         return {"status": "ok"}
     except Exception as e:
         return {"error": str(e)}
@@ -115,14 +113,13 @@ async def check_inbox(server_url: str = "http://127.0.0.1:54321"):
 @app.post("/api/download")
 async def download_file(
     file_id: int = Form(...),
-    server_url: str = Form("http://127.0.0.1:54321"),
-    pqc_psk: str = Form(None)
+    server_url: str = Form("http://127.0.0.1:54321")
 ):
     client = get_client()
     out_dir = app.state.keystore_dir / "downloads"
     out_dir.mkdir(exist_ok=True)
     try:
-        await client.download(file_id, server_url, out_dir, pqc_psk=pqc_psk or app.state.pqc_psk)
+        await client.download(file_id, server_url, out_dir)
         return {"status": "ok"}
     except Exception as e:
         return {"error": str(e)}

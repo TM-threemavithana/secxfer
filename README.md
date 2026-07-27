@@ -278,3 +278,18 @@ pytest tests/test_crypto_v1.py -v   # Cryptographic primitives
 pytest tests/test_transfer_v1.py -v  # Wire protocol & replay protection
 pytest tests/test_cli_v1.py -v       # CLI integration
 ```
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for our Git Flow branching strategy, commit message conventions, and development setup guide.
+
+---
+
+## Security Disclosure
+
+**Do not open a public GitHub issue for security vulnerabilities.**
+
+See [SECURITY.md](SECURITY.md) for our responsible disclosure policy. We acknowledge reports within 48 hours and aim to patch critical issues within 14 days.
+

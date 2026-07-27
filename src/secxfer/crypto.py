@@ -60,6 +60,9 @@ from nacl.exceptions import CryptoError as _NaClCryptoError
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
+import oqs
+
+
 
 # ---------------------------------------------------------------------------
 # Public errors
@@ -101,7 +104,7 @@ def derive_stream_key(
     local_privkey: bytes,
     remote_pubkey: bytes,
     stream_salt: bytes,
-    pqc_psk: str | None = None,
+    kyber_secret: bytes | None = None,
 ) -> bytes:
     """
     Derive a 32-byte secretstream key from a Curve25519 DH exchange.
@@ -130,17 +133,15 @@ def derive_stream_key(
         remote_pubkey:  32-byte raw Curve25519 public key.
         stream_salt:    24 bytes of fresh randomness generated per transfer
                         by the sender (sent in the wire preamble).
+        kyber_secret:   Optional 32-byte ML-KEM-768 shared secret to mix.
 
     Returns:
         32-byte key for ``SecretstreamPusher`` / ``SecretstreamPuller``.
     """
     shared_secret: bytes = _nb.crypto_scalarmult(local_privkey, remote_pubkey)
-    if pqc_psk:
-        # C4 fix: use HMAC-SHA256 (not plain concat+hash) to mix the PSK.
-        # The PSK is first stretched via SHA-256 to produce a fixed-length key
-        # for HMAC, preventing length-extension and weak-PSK attacks.
-        psk_key = hashlib.sha256(pqc_psk.encode('utf-8')).digest()
-        shared_secret = _hmac.new(psk_key, shared_secret, hashlib.sha256).digest()
+    if kyber_secret:
+        # Mix the ML-KEM-768 shared secret into the DH output
+        shared_secret = _hmac.new(kyber_secret, shared_secret, hashlib.sha256).digest()
         
     return _hkdf_sha256(
         ikm=shared_secret,
@@ -157,6 +158,26 @@ def generate_ephemeral_keypair() -> tuple[bytes, bytes]:
     priv = os.urandom(32)
     pub = _nb.crypto_scalarmult_base(priv)
     return priv, pub
+
+
+def kyber_generate_keypair() -> tuple[bytes, bytes]:
+    """Generate ML-KEM-768 keypair. Returns (pubkey, privkey)."""
+    with oqs.KeyEncapsulation("Kyber768") as kem:
+        pubkey = kem.generate_keypair()
+        privkey = kem.export_secret_key()
+        return pubkey, privkey
+
+
+def kyber_encapsulate(pubkey: bytes) -> tuple[bytes, bytes]:
+    """Encapsulate ML-KEM-768. Returns (ciphertext, shared_secret)."""
+    with oqs.KeyEncapsulation("Kyber768") as kem:
+        return kem.encap_secret(pubkey)
+
+
+def kyber_decapsulate(privkey: bytes, ciphertext: bytes) -> bytes:
+    """Decapsulate ML-KEM-768. Returns shared_secret."""
+    with oqs.KeyEncapsulation("Kyber768", secret_key=privkey) as kem:
+        return kem.decap_secret(ciphertext)
 
 
 

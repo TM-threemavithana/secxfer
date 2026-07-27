@@ -88,10 +88,10 @@ def build_file_v2(
     receiver_key_id: bytes,
     receiver_prekey_id: str,
     receiver_prekey_pubkey: bytes,
+    receiver_kyber_pubkey: bytes,
     file_path: Path | str,
     ttl_seconds: int = 300,
     chunk_size: int = CHUNK_SIZE,
-    pqc_psk: str | None = None,
 ) -> bytes:
     """Builds the encrypted V2 payload for uploading to the directory server."""
     file_path = Path(file_path)
@@ -99,7 +99,11 @@ def build_file_v2(
     stream_salt = os.urandom(24)
 
     ephemeral_priv, ephemeral_pub = generate_ephemeral_keypair()
-    stream_key = derive_stream_key(ephemeral_priv, receiver_prekey_pubkey, stream_salt, pqc_psk=pqc_psk)
+    
+    from secxfer.crypto import kyber_encapsulate
+    kyber_ct, kyber_ss = kyber_encapsulate(receiver_kyber_pubkey)
+
+    stream_key = derive_stream_key(ephemeral_priv, receiver_prekey_pubkey, stream_salt, kyber_secret=kyber_ss)
     pusher = SecretstreamPusher(stream_key)
 
     prekey_id_bytes = receiver_prekey_id.encode('ascii').ljust(16, b'\x00')
@@ -115,7 +119,8 @@ def build_file_v2(
         ephemeral_pub=ephemeral_pub,
         sig=sig,
         stream_salt=stream_salt,
-        stream_header=pusher.header
+        stream_header=pusher.header,
+        kyber_ciphertext=kyber_ct
     )
     payload.extend(preamble.pack())
 
@@ -159,7 +164,6 @@ def decrypt_file_v2(
     ciphertext: bytes,
     dest_path: Path | str,
     nonce_cache: NonceCache,
-    pqc_psk: str | None = None,
 ) -> None:
     """Decrypts a downloaded V2 payload."""
     if not ciphertext:
@@ -187,7 +191,10 @@ def decrypt_file_v2(
     if local_priv is None:
         raise PreKeyConsumedError(f"Pre-key {prekey_id_str} not found or already burned.")
 
-    stream_key = derive_stream_key(local_priv, preamble.ephemeral_pub, preamble.stream_salt, pqc_psk=pqc_psk)
+    from secxfer.crypto import kyber_decapsulate
+    kyber_ss = kyber_decapsulate(identity.kyber_privkey, preamble.kyber_ciphertext)
+
+    stream_key = derive_stream_key(local_priv, preamble.ephemeral_pub, preamble.stream_salt, kyber_secret=kyber_ss)
     puller = SecretstreamPuller(stream_key, preamble.stream_header)
 
     # Read Metadata

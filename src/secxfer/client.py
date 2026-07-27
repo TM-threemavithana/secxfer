@@ -41,7 +41,6 @@ class SecXferClient:
         file_path: Path | str,
         server_url: str,
         ttl_seconds: int = 300,
-        pqc_psk: Optional[str] = None,
     ) -> None:
         """
         Sends an encrypted file to the central server (Store-and-Forward).
@@ -87,9 +86,9 @@ class SecXferClient:
             receiver_key_id,
             receiver_prekey_id,
             receiver_prekey_pubkey,
+            pinned_peer.kyber,
             file_path,
             ttl_seconds=ttl_seconds,
-            pqc_psk=pqc_psk,
         )
         
         logger.info(f"Uploading {len(payload)} encrypted bytes to server...")
@@ -114,11 +113,9 @@ class SecXferClient:
         return await asyncio.to_thread(fetch)
 
     async def download(
-        self,
         file_id: int,
         server_url: str,
-        dest_path: Path | str,
-        pqc_psk: Optional[str] = None
+        dest_path: Path | str
     ) -> None:
         """Downloads and decrypts a pending file."""
         logger.info(f"Downloading file {file_id} from {server_url}...")
@@ -136,8 +133,7 @@ class SecXferClient:
             self.identity_path.parent,
             ciphertext,
             dest_path,
-            self.nonce_cache,
-            pqc_psk=pqc_psk
+            self.nonce_cache
         )
         logger.info("Decryption complete!")
 

@@ -118,3 +118,38 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = "static/"
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/6.0/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+CORS_ALLOW_ALL_ORIGINS = True
+
+# ── Cache (Challenge Nonce Store) ────────────────────────────────────────────
+# Uses Django's database cache so challenge nonces survive server restarts
+# and are safe for multi-worker deployments.
+# Run: python manage.py createcachetable
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "secxfer_cache_table",
+        "TIMEOUT": 300,  # 5-minute TTL for challenge nonces
+    }
+}
+
+# ── Production Database ───────────────────────────────────────────────────────
+# For production deployments, replace the SQLite config above with:
+#
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.environ.get("DB_NAME", "secxfer"),
+#         "USER": os.environ.get("DB_USER", "secxfer"),
+#         "PASSWORD": os.environ.get("DB_PASSWORD", ""),
+#         "HOST": os.environ.get("DB_HOST", "localhost"),
+#         "PORT": os.environ.get("DB_PORT", "5432"),
+#     }
+# }
+# Also run: pip install psycopg2-binary
+

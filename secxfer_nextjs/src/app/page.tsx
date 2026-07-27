@@ -1,14 +1,44 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Component, type ReactNode } from "react";
 
-const API_BASE = "http://127.0.0.1:8085/api";
-const SERVER_URL = "http://127.0.0.1:8001";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8085/api";
+const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://127.0.0.1:8001";
 
 type LogEntry = { msg: string; level: "info" | "success" | "error" | "warn" };
 type InboxItem = { file_id: string; sender_key_id: string; timestamp: number; size: number };
 type AuditEntry = { id: number; event_type: string; details_raw: string; previous_hash: string; current_hash: string; timestamp: number };
 type StatusData = { identity_name?: string; key_id?: string; prekeys_available?: number; status?: string };
+
+// ── Error Boundary ──────────────────────────────────────────────────────────
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; message: string }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: "" };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error.message };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#080c14] text-white flex items-center justify-center">
+          <div className="bg-red-900/40 border border-red-700 rounded-2xl p-8 max-w-lg text-center">
+            <div className="text-5xl mb-4">🚨</div>
+            <h2 className="text-2xl font-bold text-red-300 mb-2">Application Error</h2>
+            <p className="text-slate-400 text-sm font-mono">{this.state.message}</p>
+            <button onClick={() => this.setState({ hasError: false, message: "" })}
+              className="mt-6 bg-red-700 hover:bg-red-600 text-white px-6 py-2 rounded-lg transition-colors">
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+// ────────────────────────────────────────────────────────────────────────────
 
 export default function Home() {
   const [unlocked, setUnlocked] = useState(false);
@@ -22,6 +52,7 @@ export default function Home() {
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [auditStatus, setAuditStatus] = useState<"idle" | "checking" | "ok" | "fail">("idle");
   const [sending, setSending] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const logEndRef = useRef<HTMLDivElement>(null);
 
   const log = (msg: string, level: LogEntry["level"] = "info") => {
@@ -83,24 +114,40 @@ export default function Home() {
     e.preventDefault();
     if (!file || !recipient) { log("Please select a recipient and a file.", "warn"); return; }
     setSending(true);
-    log(`Encrypting "${file.name}" with X3DH + AES-256-GCM for "${recipient}"...`, "info");
+    setUploadProgress(0);
+    log(`Encrypting "${file.name}" with X3DH + XChaCha20-Poly1305 for "${recipient}"...`, "info");
     const formData = new FormData();
     formData.append("receiver_name", recipient);
     formData.append("file", file);
     formData.append("server_url", SERVER_URL);
     try {
-      const res = await fetch(`${API_BASE}/send`, { method: "POST", body: formData });
-      const data = await res.json();
-      if (data.status === "ok") {
-        log(`Uploaded encrypted payload to Django server. Zero-Trust guaranteed.`, "success");
-        setFile(null); setRecipient("");
-      } else {
-        log(`Error: ${data.error}`, "error");
-      }
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `${API_BASE}/send`);
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            setUploadProgress(Math.round((event.loaded / event.total) * 100));
+          }
+        };
+        xhr.onload = () => {
+          const data = JSON.parse(xhr.responseText);
+          if (data.status === "ok") {
+            log(`Encrypted payload uploaded to Django KDC. Zero-Trust guaranteed.`, "success");
+            setFile(null); setRecipient(""); setUploadProgress(0);
+            resolve();
+          } else {
+            log(`Error: ${data.error}`, "error");
+            reject(new Error(data.error));
+          }
+        };
+        xhr.onerror = () => reject(new Error("Network error"));
+        xhr.send(formData);
+      });
     } catch (err: any) {
       log(`Failed: ${err.message}`, "error");
     } finally {
       setSending(false);
+      setUploadProgress(0);
     }
   };
 
@@ -247,9 +294,17 @@ export default function Home() {
                       <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} className="text-sm text-slate-300" />
                       {file && <p className="text-xs text-emerald-400 mt-1">Selected: {file.name} ({(file.size / 1024).toFixed(1)} KB)</p>}
                     </div>
+                    {sending && uploadProgress > 0 && (
+                      <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                        <div
+                          className="h-2 bg-gradient-to-r from-purple-500 to-indigo-500 transition-all duration-300 ease-out"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      </div>
+                    )}
                     <button disabled={sending}
                       className="w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all hover:scale-[1.01] active:scale-95">
-                      {sending ? "⏳ Encrypting & Uploading..." : "🔐 Encrypt & Send (Store & Forward)"}
+                      {sending ? `⏳ Uploading... ${uploadProgress}%` : "🔐 Encrypt & Send (Store & Forward)"}
                     </button>
                   </form>
                 </div>
@@ -341,5 +396,13 @@ export default function Home() {
         )}
       </div>
     </main>
+  );
+}
+
+export function SecXferAppWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <Home />
+    </ErrorBoundary>
   );
 }

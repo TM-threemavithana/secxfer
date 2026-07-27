@@ -5,23 +5,22 @@ import time
 import hashlib
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
 from nacl.signing import VerifyKey
 from .models import UserIdentity, PreKey, EncryptedFile, AuditLog
 
-_CHALLENGES = {}
-_CHALLENGE_TTL = 300
+_CHALLENGE_TTL = 300  # seconds
 
 def _issue_challenge(key_id_hex: str) -> str:
     nonce = secrets.token_bytes(32).hex()
-    _CHALLENGES[key_id_hex] = (nonce, time.time() + _CHALLENGE_TTL)
+    cache.set(f"challenge:{key_id_hex}", nonce, timeout=_CHALLENGE_TTL)
     return nonce
 
 def _consume_challenge(key_id_hex: str):
-    entry = _CHALLENGES.pop(key_id_hex, None)
-    if entry is None:
-        return None
-    nonce, expiry = entry
-    return None if time.time() > expiry else nonce
+    nonce = cache.get(f"challenge:{key_id_hex}")
+    if nonce:
+        cache.delete(f"challenge:{key_id_hex}")
+    return nonce
 
 def _verify_pop(identity_pubkey_hex: str, nonce_hex: str, signature_hex: str) -> bool:
     try:

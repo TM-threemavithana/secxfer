@@ -8,7 +8,7 @@ PROTOCOL_VERSION_V2: int = 0x02
 _PREAMBLE_FMT_V1: str = ">16s24s24s" # (version byte read separately)
 PREAMBLE_SIZE_V1: int = struct.calcsize(_PREAMBLE_FMT_V1)
 
-_PREAMBLE_FMT_V2: str = ">16s16s32s64s24s24s" # (version byte read separately)
+_PREAMBLE_FMT_V2: str = ">16s16s32s64s24s24s1088s" # (version byte read separately)
 PREAMBLE_SIZE_V2: int = struct.calcsize(_PREAMBLE_FMT_V2)
 
 _CHUNK_LEN_FMT: str = ">I"                             # uint32 big-endian
@@ -91,6 +91,7 @@ class V2Preamble:
     sig: bytes
     stream_salt: bytes
     stream_header: bytes
+    kyber_ciphertext: bytes
 
     def pack(self) -> bytes:
         return struct.pack(
@@ -100,7 +101,8 @@ class V2Preamble:
             self.ephemeral_pub,
             self.sig,
             self.stream_salt,
-            self.stream_header
+            self.stream_header,
+            self.kyber_ciphertext
         )
 
     @classmethod
@@ -108,10 +110,10 @@ class V2Preamble:
         if len(raw) != PREAMBLE_SIZE_V2:
             raise WireError(f"Expected {PREAMBLE_SIZE_V2} bytes for V2 preamble, got {len(raw)}")
         
-        sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header = struct.unpack(
+        sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header, kyber_ciphertext = struct.unpack(
             _PREAMBLE_FMT_V2, raw
         )
-        return cls(sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header)
+        return cls(sender_key_id, prekey_id_bytes, ephemeral_pub, sig, stream_salt, stream_header, kyber_ciphertext)
 
 def pack_chunk_len(chunk_len: int) -> bytes:
     return struct.pack(_CHUNK_LEN_FMT, chunk_len)
