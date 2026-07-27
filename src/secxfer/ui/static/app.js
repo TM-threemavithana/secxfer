@@ -118,12 +118,11 @@ $('send-form').addEventListener('submit', async (e) => {
 
     const fd = new FormData();
     fd.append('target_key_id', $('send-target').value);
-    fd.append('target_host', $('send-host').value || '127.0.0.1');
-    fd.append('target_port', $('send-port').value || '9090');
+    fd.append('server_url', $('send-server').value || 'http://127.0.0.1:54321');
     fd.append('file', file);
     fd.append('pqc_psk', $('send-pqc').value);
 
-    log(`Starting encrypted P2P transfer to ${$('send-target').value} @ ${$('send-host').value}:${$('send-port').value}...`, "info");
+    log(`Uploading encrypted file to ${$('send-server').value} for ${$('send-target').value}...`, "info");
     const btn = e.target.querySelector('button');
     btn.textContent = "Sending...";
     btn.disabled = true;
@@ -143,30 +142,118 @@ $('send-form').addEventListener('submit', async (e) => {
     }
 });
 
-$('receive-form').addEventListener('submit', async (e) => {
+$('inbox-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const fd = new FormData();
-    fd.append('port', $('receive-port').value);
-    fd.append('pqc_psk', $('receive-pqc').value);
-
-    log(`Listening for incoming transfer on port ${$('receive-port').value}...`, "info");
+    const server_url = $('inbox-server').value;
+    log(`Checking inbox at ${server_url}...`, "info");
     const btn = e.target.querySelector('button');
-    btn.textContent = "Listening...";
+    btn.textContent = "Checking...";
     btn.disabled = true;
 
     try {
-        const res = await fetch('/api/receive', { method: 'POST', body: fd });
+        const res = await fetch(`/api/inbox?server_url=${encodeURIComponent(server_url)}`);
         const data = await res.json();
-        if (data.error) log(`Receive failed: ${data.error}`, "error");
-        else log("File received successfully! Check keystore/downloads directory.", "success");
+        if (data.error) {
+            log(`Inbox check failed: ${data.error}`, "error");
+        } else {
+            const list = $('inbox-list');
+            list.innerHTML = "";
+            if (data.inbox.length === 0) {
+                list.innerHTML = "<p>Inbox is empty.</p>";
+            } else {
+                data.inbox.forEach(file => {
+                    const div = document.createElement('div');
+                    div.style = "padding: 10px; background: rgba(255,255,255,0.05); margin-bottom: 5px; border-radius: 4px; display: flex; justify-content: space-between;";
+                    div.innerHTML = `
+                        <div>
+                            <strong>Sender ID:</strong> ${file.sender_key_id}<br>
+                            <strong>Size:</strong> ${(file.size/1024).toFixed(1)} KB<br>
+                            <strong>Date:</strong> ${new Date(file.timestamp * 1000).toLocaleString()}
+                        </div>
+                        <button class="btn secondary" onclick="downloadFile(${file.file_id})">Download</button>
+                    `;
+                    list.appendChild(div);
+                });
+            }
+            log("Inbox refreshed.", "success");
+        }
     } catch(err) {
         log(`Network error: ${err}`, "error");
     } finally {
-        btn.textContent = "Listen for Transfer";
+        btn.textContent = "Check Inbox";
         btn.disabled = false;
     }
 });
 
+async function downloadFile(file_id) {
+    const server_url = $('inbox-server').value;
+    const pqc_psk = $('receive-pqc').value;
+    log(`Downloading and decrypting file ${file_id}...`, "info");
+    
+    const fd = new FormData();
+    fd.append('file_id', file_id);
+    fd.append('server_url', server_url);
+    fd.append('pqc_psk', pqc_psk);
+    
+    try {
+        const res = await fetch('/api/download', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.error) log(`Download failed: ${data.error}`, "error");
+        else log(`File downloaded and decrypted successfully! Check keystore/downloads directory.`, "success");
+    } catch(err) {
+        log(`Network error: ${err}`, "error");
+    }
+}
+
 // Init
 checkStatus();
 setInterval(checkStatus, 5000);
+
+async function verifyServerAudit() {
+    const server_url = $('audit-server').value;
+    log(`Fetching cryptographic audit log from ${server_url}...`, "info");
+    
+    try {
+        const res = await fetch(`/api/audit?server_url=${encodeURIComponent(server_url)}`);
+        const data = await res.json();
+        
+        if (data.error) {
+            log(`Audit fetch failed: ${data.error}`, "error");
+            return;
+        }
+        
+        const logs = data.log;
+        if (!logs || logs.length === 0) {
+            log("Audit log is empty.", "info");
+            return;
+        }
+        
+        let previous_hash = "GENESIS_HASH";
+        for (let i = 0; i < logs.length; i++) {
+            const entry = logs[i];
+            
+            const hash_input = `${entry.event_type}|${entry.details_raw}|${entry.timestamp}|${previous_hash}`;
+            
+            const msgBuffer = new TextEncoder().encode(hash_input);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const current_hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            
+            if (entry.previous_hash !== previous_hash) {
+                log(`[CRITICAL] Chain broken at block ${entry.id}. Expected previous hash ${previous_hash}, got ${entry.previous_hash}. SERVER TAMPERING DETECTED!`, "error");
+                return;
+            }
+            if (current_hash !== entry.current_hash) {
+                log(`[CRITICAL] Data manipulation detected at block ${entry.id}. Calculated hash ${current_hash} != ${entry.current_hash}. SERVER TAMPERING DETECTED!`, "error");
+                return;
+            }
+            
+            previous_hash = current_hash;
+        }
+        
+        log(`Success! Cryptographic integrity verified for all ${logs.length} blocks in the server audit log. No tampering detected.`, "success");
+        
+    } catch(err) {
+        log(`Network error: ${err}`, "error");
+    }
+}

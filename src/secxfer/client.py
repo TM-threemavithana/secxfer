@@ -7,7 +7,7 @@ import sys
 import asyncio
 
 from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError, get_unused_prekeys
-from secxfer.transfer import send_file_v1, send_file_v2, receive_file, NonceCache, ProtocolError, AsyncReader, AsyncWriter
+from secxfer.transfer import build_file_v2, decrypt_file_v2, NonceCache, ProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ class SecXferClient:
         self.nonce_cache = NonceCache(db_path=self.keystore_dir / "nonces.db")
         self.http_proxy = "socks5://127.0.0.1:9050" if use_tor else None
         
-        # Identity name is usually the stem of the identity file
         self.identity_name = self.identity_path.stem
         
         if len(self.keystore) == 0:
@@ -40,105 +39,107 @@ class SecXferClient:
         self,
         receiver_name: str,
         file_path: Path | str,
-        out_stream: AsyncWriter,
-        server_url: Optional[str] = None,
+        server_url: str,
         ttl_seconds: int = 300,
         pqc_psk: Optional[str] = None,
     ) -> None:
         """
-        Sends a file. If server_url is provided, uses V2 Forward Secrecy.
-        Otherwise, receiver_name must be a path to a public key (V1).
+        Sends an encrypted file to the central server (Store-and-Forward).
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        if server_url:
-            # V2 (Server-Assisted / X3DH mode)
-            pub_file = self.keystore_dir / f"{receiver_name}.pub"
-            if not pub_file.exists():
-                raise ProtocolError(f"Receiver {receiver_name} is not pinned! Run 'pin' first.")
-            pinned_peer_bytes = pub_file.read_bytes()
-            receiver_key_id = key_id_from_x25519_pubkey(pinned_peer_bytes[:32])
-
-            logger.info(f"Using server-assisted V2 transfer via {server_url} to {receiver_name} ({receiver_key_id.hex()})")
-            req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_key_id.hex())
-
-            def fetch_keys():
-                with urllib.request.urlopen(req, timeout=10.0) as response:
-                    return json.loads(response.read().decode())
-
-            try:
-                data = await asyncio.to_thread(fetch_keys)
-            except Exception as exc:
-                raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
-
-            server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+        pub_file = self.keystore_dir / f"{receiver_name}.pub"
+        if not pub_file.exists():
+            raise ProtocolError(f"Receiver {receiver_name} is not pinned! Run 'pin' first.")
             
-            try:
-                pinned_peer = self.keystore.get(receiver_key_id)
-            except UnknownSenderError:
-                raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
-            
-            if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
-                raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
+        pinned_peer_bytes = pub_file.read_bytes()
+        receiver_key_id = key_id_from_x25519_pubkey(pinned_peer_bytes[:32])
 
-            receiver_prekey_id = data["prekey"]["id"]
-            receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
+        logger.info(f"Fetching Pre-Keys from {server_url} for {receiver_name} ({receiver_key_id.hex()})")
+        req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_key_id.hex())
 
-            await send_file_v2(
-                self.identity,
-                receiver_key_id,
-                receiver_prekey_id,
-                receiver_prekey_pubkey,
-                file_path,
-                out_stream,
-                ttl_seconds=ttl_seconds,
-                pqc_psk=pqc_psk,
-            )
-        else:
-            # V1 (P2P mode)
-            logger.info(f"Using P2P V1 transfer to {receiver_name}")
-            pub_path = Path(receiver_name)
-            if not pub_path.exists():
-                raise FileNotFoundError(f"Public key file not found: {pub_path}")
+        def fetch_keys():
+            with urllib.request.urlopen(req, timeout=10.0) as response:
+                return json.loads(response.read().decode())
 
-            pubkey_bytes = pub_path.read_bytes()
-            if len(pubkey_bytes) != 64:
-                raise ValueError("Public key file must be exactly 64 bytes (X25519 + Ed25519).")
-            receiver_pubkey_x25519 = pubkey_bytes[:32]
+        try:
+            data = await asyncio.to_thread(fetch_keys)
+        except Exception as exc:
+            raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
 
-            await send_file_v1(
-                self.identity,
-                receiver_pubkey_x25519,
-                file_path,
-                out_stream,
-                ttl_seconds=ttl_seconds,
-                pqc_psk=pqc_psk,
-            )
+        server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+        
+        try:
+            pinned_peer = self.keystore.get(receiver_key_id)
+        except UnknownSenderError:
+            raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
+        
+        if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+            raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
 
-    async def receive(
+        receiver_prekey_id = data["prekey"]["id"]
+        receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
+
+        payload = build_file_v2(
+            self.identity,
+            receiver_key_id,
+            receiver_prekey_id,
+            receiver_prekey_pubkey,
+            file_path,
+            ttl_seconds=ttl_seconds,
+            pqc_psk=pqc_psk,
+        )
+        
+        logger.info(f"Uploading {len(payload)} encrypted bytes to server...")
+        upload_req = urllib.request.Request(server_url.rstrip("/") + "/upload", data=payload, method="POST")
+        upload_req.add_header("X-Receiver-Key-Id", receiver_key_id.hex())
+        upload_req.add_header("X-Sender-Key-Id", self.identity.key_id.hex())
+        upload_req.add_header("Content-Type", "application/octet-stream")
+        
+        def do_upload():
+            with urllib.request.urlopen(upload_req, timeout=30.0) as resp:
+                return resp.read()
+                
+        await asyncio.to_thread(do_upload)
+        logger.info("Upload complete!")
+
+    async def check_inbox(self, server_url: str) -> list:
+        """Polls the server for pending encrypted files."""
+        req = urllib.request.Request(server_url.rstrip("/") + "/inbox/" + self.identity.key_id.hex())
+        def fetch():
+            with urllib.request.urlopen(req, timeout=10.0) as response:
+                return json.loads(response.read().decode())['inbox']
+        return await asyncio.to_thread(fetch)
+
+    async def download(
         self,
-        inp_stream: AsyncReader,
+        file_id: int,
+        server_url: str,
         dest_path: Path | str,
-        pqc_psk: Optional[str] = None,
+        pqc_psk: Optional[str] = None
     ) -> None:
-        """
-        Decrypt and verify a file from a binary stream.
-        """
-        dest_path = Path(dest_path)
-        logger.info(f"Receiving transfer to {dest_path}")
-        await receive_file(
-            self.identity, 
-            self.keystore, 
-            self.identity_path.parent, 
-            self.identity_name, 
-            inp_stream, 
-            dest_path, 
+        """Downloads and decrypts a pending file."""
+        logger.info(f"Downloading file {file_id} from {server_url}...")
+        req = urllib.request.Request(server_url.rstrip("/") + f"/download/{file_id}")
+        def fetch():
+            with urllib.request.urlopen(req, timeout=30.0) as response:
+                return response.read()
+        
+        ciphertext = await asyncio.to_thread(fetch)
+        logger.info(f"Downloaded {len(ciphertext)} bytes. Decrypting...")
+        
+        decrypt_file_v2(
+            self.identity,
+            self.keystore,
+            self.identity_path.parent,
+            ciphertext,
+            dest_path,
             self.nonce_cache,
             pqc_psk=pqc_psk
         )
-
+        logger.info("Decryption complete!")
 
     def __del__(self):
         try:

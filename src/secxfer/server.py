@@ -58,6 +58,7 @@ def _verify_pop(identity_pubkey_hex: str, nonce_hex: str, signature_hex: str) ->
 
 
 def init_db():
+    os.makedirs('server_vault', exist_ok=True)
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -78,6 +79,50 @@ def init_db():
                 used INTEGER DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )"""
+        )
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS encrypted_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_key_id TEXT NOT NULL,
+                receiver_key_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                size INTEGER NOT NULL
+            )"""
+        )
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                details TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                current_hash TEXT NOT NULL,
+                timestamp REAL NOT NULL
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+import hashlib
+
+def append_audit_log(event_type: str, details: dict):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT current_hash FROM audit_log ORDER BY id DESC LIMIT 1')
+        row = cursor.fetchone()
+        previous_hash = row[0] if row else "GENESIS_HASH"
+        
+        timestamp_val = time.time()
+        details_json = json.dumps(details, sort_keys=True)
+        
+        hash_input = f"{event_type}|{details_json}|{timestamp_val}|{previous_hash}".encode('utf-8')
+        current_hash = hashlib.sha256(hash_input).hexdigest()
+        
+        cursor.execute(
+            'INSERT INTO audit_log (event_type, details, previous_hash, current_hash, timestamp) VALUES (?, ?, ?, ?, ?)',
+            (event_type, details_json, previous_hash, current_hash, timestamp_val)
         )
         conn.commit()
         conn.close()
@@ -153,11 +198,108 @@ class KDCRequestHandler(BaseHTTPRequestHandler):
                     self._send_error(500, f"Database error: {str(e)}")
                 finally:
                     conn.close()
+
+        elif parsed.path.startswith('/inbox/'):
+            key_id = urllib.parse.unquote(parsed.path[len('/inbox/'):])
+            if not key_id:
+                self._send_error(400, "key_id required")
+                return
+            with DB_LOCK:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                try:
+                    cursor.execute('SELECT id, sender_key_id, timestamp, size FROM encrypted_files WHERE receiver_key_id = ?', (key_id,))
+                    files = [{"file_id": r[0], "sender_key_id": r[1], "timestamp": r[2], "size": r[3]} for r in cursor.fetchall()]
+                    self._send_json(200, {"inbox": files})
+                except sqlite3.Error as e:
+                    self._send_error(500, f"Database error: {str(e)}")
+                finally:
+                    conn.close()
+
+        elif parsed.path.startswith('/download/'):
+            file_id = urllib.parse.unquote(parsed.path[len('/download/'):])
+            if not file_id.isdigit():
+                self._send_error(400, "invalid file_id")
+                return
+            with DB_LOCK:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('SELECT file_path FROM encrypted_files WHERE id = ?', (int(file_id),))
+                row = cursor.fetchone()
+                conn.close()
+            
+            if not row or not os.path.exists(row[0]):
+                self._send_error(404, "File not found")
+                return
+                
+            append_audit_log("DOWNLOAD", {"file_id": file_id})
+            
+            file_path = row[0]
+            size = os.path.getsize(file_path)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(size))
+            self.end_headers()
+            with open(file_path, 'rb') as f:
+                self.wfile.write(f.read())
+
+        elif parsed.path == '/audit/log':
+            with DB_LOCK:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('SELECT id, event_type, details, previous_hash, current_hash, timestamp FROM audit_log ORDER BY id ASC')
+                logs = [{"id": r[0], "event_type": r[1], "details_raw": r[2], "previous_hash": r[3], "current_hash": r[4], "timestamp": r[5]} for r in cursor.fetchall()]
+                conn.close()
+            self._send_json(200, {"log": logs})
+
         else:
             self._send_error(404, "Not Found")
 
     def do_POST(self):
-        if self.path != '/register':
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == '/upload':
+            receiver_key_id = self.headers.get('X-Receiver-Key-Id')
+            sender_key_id = self.headers.get('X-Sender-Key-Id')
+            if not receiver_key_id or not sender_key_id:
+                self._send_error(400, "Missing X-Receiver-Key-Id or X-Sender-Key-Id header")
+                return
+                
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                self._send_error(400, "Empty body")
+                return
+                
+            file_id = secrets.token_hex(16)
+            file_path = os.path.join('server_vault', file_id + ".bin")
+            
+            bytes_written = 0
+            with open(file_path, 'wb') as f:
+                remaining = content_length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+                    bytes_written += len(chunk)
+            
+            with DB_LOCK:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT INTO encrypted_files (sender_key_id, receiver_key_id, file_path, timestamp, size) VALUES (?, ?, ?, ?, ?)',
+                    (sender_key_id, receiver_key_id, file_path, time.time(), bytes_written)
+                )
+                conn.commit()
+                conn.close()
+            
+            append_audit_log("UPLOAD", {"sender": sender_key_id, "receiver": receiver_key_id, "file_id": file_id, "size": bytes_written})
+            
+            self._send_json(200, {"status": "uploaded"})
+            return
+
+        if parsed.path != '/register':
             self._send_error(404, "Not Found")
             return
 
@@ -220,6 +362,8 @@ class KDCRequestHandler(BaseHTTPRequestHandler):
                 self._send_error(500, f"Database error: {str(e)}")
             finally:
                 conn.close()
+        
+        append_audit_log("REGISTER", {"key_id": key_id, "prekeys_added": len(prekeys)})
 
 
 def serve(port=54321):

@@ -95,9 +95,8 @@ from secxfer.transfer import (
     TruncationError,
     VersionError,
     PreKeyConsumedError,
-    receive_file,
-    send_file_v1,
-    send_file_v2,
+    build_file_v2,
+    decrypt_file_v2,
 )
 
 

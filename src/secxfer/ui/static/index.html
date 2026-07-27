@@ -27,6 +27,10 @@
                     <span id="status-keyid" class="value">---</span>
                 </div>
             </div>
+            <div style="margin-top: 15px; text-align: center;">
+                <input type="text" id="audit-server" placeholder="Server URL" value="http://127.0.0.1:54321" style="width: 200px; display: inline-block;">
+                <button onclick="verifyServerAudit()" class="btn secondary" style="display: inline-block;">Verify Server Integrity</button>
+            </div>
         </div>
 
         <div id="unlock-panel" class="panel glass hidden">
@@ -51,7 +55,7 @@
             <div class="tabs">
                 <button class="tab active" onclick="switchTab('register')">Register</button>
                 <button class="tab" onclick="switchTab('send')">Send File</button>
-                <button class="tab" onclick="switchTab('receive')">Receive File</button>
+                <button class="tab" onclick="switchTab('receive')">Inbox</button>
             </div>
 
             <div id="tab-register" class="tab-content active">
@@ -64,13 +68,10 @@
             </div>
 
             <div id="tab-send" class="tab-content hidden">
-                <h3>Send File (P2P)</h3>
+                <h3>Send File (Store & Forward)</h3>
                 <form id="send-form">
-                    <input type="text" id="send-target" placeholder="Target Pubkey Path (e.g. ./bob_keys/bob.pub)" required>
-                    <div style="display:flex;gap:8px;">
-                        <input type="text" id="send-host" placeholder="Target Host (default: 127.0.0.1)" value="127.0.0.1" style="flex:2">
-                        <input type="number" id="send-port" placeholder="Port" value="9090" style="flex:1">
-                    </div>
+                    <input type="text" id="send-target" placeholder="Receiver Name (e.g., bob)" required>
+                    <input type="text" id="send-server" placeholder="Server URL" value="http://127.0.0.1:54321" required>
                     <input type="password" id="send-pqc" placeholder="PQC Pre-Shared Key (Optional)">
                     <div class="file-drop" id="file-drop">
                         <input type="file" id="send-file" required>
@@ -81,12 +82,14 @@
             </div>
 
             <div id="tab-receive" class="tab-content hidden">
-                <h3>Receive File (P2P)</h3>
-                <form id="receive-form">
-                    <input type="number" id="receive-port" placeholder="Port (Default: 9090)" value="9090">
+                <h3>Secure Inbox</h3>
+                <p>Check the central server for pending encrypted files.</p>
+                <form id="inbox-form">
+                    <input type="text" id="inbox-server" placeholder="Server URL" value="http://127.0.0.1:54321" required>
                     <input type="password" id="receive-pqc" placeholder="PQC Pre-Shared Key (Optional)">
-                    <button type="submit" class="btn primary">Listen for Transfer</button>
+                    <button type="submit" class="btn primary">Check Inbox</button>
                 </form>
+                <div id="inbox-list" style="margin-top: 15px;"></div>
             </div>
         </div>
 

@@ -31,3 +31,19 @@ ENV/
 secret.txt
 received.txt
 out.txt
+
+# SQLite databases (runtime state — do not commit)
+*.db
+*.sqlite3
+
+# Django runtime
+secxfer_django/server_vault/
+
+# Next.js build artifacts
+secxfer_nextjs/.next/
+secxfer_nextjs/node_modules/
+secxfer_nextjs/.env*.local
+
+# Server vault (encrypted file storage — runtime only)
+server_vault/
+
