@@ -69,6 +69,7 @@ export default function Home() {
     formData.append("password", password);
     try {
       const res = await fetch(`${API_BASE}/unlock`, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
       const data = await res.json();
       if (data.status === "unlocked") {
         setUnlocked(true);
@@ -85,6 +86,7 @@ export default function Home() {
   const checkStatus = async () => {
     try {
       const res = await fetch(`${API_BASE}/status`);
+      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
       const data = await res.json();
       if (data.status === "ok") {
         setStatus(data);
@@ -98,6 +100,7 @@ export default function Home() {
       const formData = new FormData();
       formData.append("server_url", SERVER_URL);
       const res = await fetch(`${API_BASE}/inbox`, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
       const data = await res.json();
       if (data.inbox) setInbox(data.inbox);
     } catch (e) {}
@@ -154,30 +157,55 @@ export default function Home() {
   const verifyServerAudit = async () => {
     setAuditStatus("checking");
     setActiveTab("audit");
-    log(`Fetching Hash-Chained Audit Log from Django server...`, "info");
-    try {
-      const res = await fetch(`${API_BASE}/audit?server_url=${encodeURIComponent(SERVER_URL)}`);
-      const data = await res.json();
-      if (data.error) { log(`Audit fetch failed: ${data.error}`, "error"); setAuditStatus("fail"); return; }
-      const logs: AuditEntry[] = data.log;
-      setAuditLogs(logs);
-      if (!logs || logs.length === 0) { log("Audit log is empty (no events yet).", "info"); setAuditStatus("ok"); return; }
+    log(`Fetching Hash-Chained Audit Log from Django server incrementally...`, "info");
+    
+    let previous_hash = "GENESIS_HASH";
+    let offset = 0;
+    const limit = 100;
+    let allLogs: AuditEntry[] = [];
+    let hasMore = true;
 
-      let previous_hash = "GENESIS_HASH";
-      for (const entry of logs) {
-        const hash_input = `${entry.event_type}|${entry.details_raw}|${entry.timestamp}|${previous_hash}`;
-        const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(hash_input));
-        const current_hash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
-        if (entry.previous_hash !== previous_hash || current_hash !== entry.current_hash) {
-          log(`[CRITICAL] Chain tampered at block #${entry.id}! SERVER INTEGRITY COMPROMISED!`, "error");
-          setAuditStatus("fail"); return;
+    try {
+      while (hasMore) {
+        const res = await fetch(`${API_BASE}/audit?server_url=${encodeURIComponent(SERVER_URL)}&limit=${limit}&offset=${offset}`);
+        if (!res.ok) throw new Error(`Server returned status ${res.status}`);
+        const data = await res.json();
+        
+        if (data.error) { throw new Error(data.error); }
+        
+        const logs: AuditEntry[] = data.log;
+        if (!logs || logs.length === 0) {
+          hasMore = false;
+          break;
         }
-        previous_hash = current_hash;
+
+        allLogs = [...allLogs, ...logs];
+        
+        for (const entry of logs) {
+          const hash_input = `${entry.event_type}|${entry.details_raw}|${entry.timestamp}|${previous_hash}`;
+          const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(hash_input));
+          const current_hash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
+          if (entry.previous_hash !== previous_hash || current_hash !== entry.current_hash) {
+            log(`[CRITICAL] Chain tampered at block #${entry.id}! SERVER INTEGRITY COMPROMISED!`, "error");
+            setAuditStatus("fail");
+            setAuditLogs(allLogs);
+            return;
+          }
+          previous_hash = current_hash;
+        }
+        
+        offset += limit;
       }
-      log(`Verified ${logs.length} blocks locally in browser. No tampering detected. Chain is intact.`, "success");
+      
+      setAuditLogs(allLogs);
+      if (allLogs.length === 0) { 
+        log("Audit log is empty (no events yet).", "info"); 
+      } else {
+        log(`Verified ${allLogs.length} blocks locally in browser. No tampering detected. Chain is intact.`, "success");
+      }
       setAuditStatus("ok");
     } catch (err: any) {
-      log(`Audit verification error: ${err}`, "error");
+      log(`Audit verification error: ${err.message}`, "error");
       setAuditStatus("fail");
     }
   };
@@ -189,6 +217,7 @@ export default function Home() {
     formData.append("server_url", SERVER_URL);
     try {
       const res = await fetch(`${API_BASE}/download`, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
       const data = await res.json();
       if (data.status === "ok") { log(`File #${file_id} decrypted and saved to downloads folder.`, "success"); fetchInbox(); }
       else { log(`Error: ${data.error}`, "error"); }

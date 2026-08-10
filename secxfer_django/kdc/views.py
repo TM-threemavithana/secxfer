@@ -8,12 +8,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.core.cache import cache
 from nacl.signing import VerifyKey
 from .models import UserIdentity, PreKey, EncryptedFile, AuditLog
-
-_CHALLENGE_TTL = 300  # seconds
+from kdc.constants import CHALLENGE_TTL
 
 def _issue_challenge(key_id_hex: str) -> str:
     nonce = secrets.token_bytes(32).hex()
-    cache.set(f"challenge:{key_id_hex}", nonce, timeout=_CHALLENGE_TTL)
+    cache.set(f"challenge:{key_id_hex}", nonce, timeout=CHALLENGE_TTL)
     return nonce
 
 def _consume_challenge(key_id_hex: str):
@@ -113,9 +112,11 @@ def upload_view(request):
     file_path = os.path.join('server_vault', file_id + ".bin")
     
     with open(file_path, 'wb') as f:
-        f.write(request.body)
+        size = 0
+        for chunk in request:
+            f.write(chunk)
+            size += len(chunk)
         
-    size = len(request.body)
     EncryptedFile.objects.create(
         sender_key_id=sender_key_id,
         receiver_key_id=receiver_key_id,
@@ -147,6 +148,12 @@ def download_view(request, file_id):
         return JsonResponse({"error": "File not found"}, status=404)
 
 def audit_log_view(request):
-    logs = AuditLog.objects.order_by('id')
+    try:
+        limit = int(request.GET.get('limit', 100))
+        offset = int(request.GET.get('offset', 0))
+    except ValueError:
+        return JsonResponse({"error": "Invalid pagination parameters"}, status=400)
+        
+    logs = AuditLog.objects.order_by('id')[offset:offset+limit]
     out = [{"id": r.id, "event_type": r.event_type, "details_raw": r.details, "previous_hash": r.previous_hash, "current_hash": r.current_hash, "timestamp": r.timestamp} for r in logs]
     return JsonResponse({"log": out})

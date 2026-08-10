@@ -12,7 +12,10 @@ import time
 import sqlite3
 from pathlib import Path
 import threading
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, AsyncGenerator
+import aiofiles
+
+from secxfer.constants import DEFAULT_TTL
 
 from secxfer.crypto import (
     CHUNK_SIZE,
@@ -63,6 +66,7 @@ class NonceCache:
             )'''
         )
         self._conn.execute('CREATE INDEX IF NOT EXISTS idx_expiry ON nonces(expiry)')
+        self._conn.execute('PRAGMA journal_mode=WAL;')
         self._conn.commit()
 
     def check_and_insert(self, sender_key_id: bytes, transfer_nonce: bytes, ttl_seconds: int) -> None:
@@ -82,18 +86,17 @@ class NonceCache:
 
     def close(self) -> None:
         self._conn.close()
-
-def build_file_v2(
+async def build_file_v2(
     identity: LocalIdentity,
     receiver_key_id: bytes,
     receiver_prekey_id: str,
     receiver_prekey_pubkey: bytes,
     receiver_kyber_pubkey: bytes,
     file_path: Path | str,
-    ttl_seconds: int = 300,
+    ttl_seconds: int = DEFAULT_TTL,
     chunk_size: int = CHUNK_SIZE,
-) -> bytes:
-    """Builds the encrypted V2 payload for uploading to the directory server."""
+) -> AsyncGenerator[bytes, None]:
+    """Builds the encrypted V2 payload and yields chunks for streaming upload."""
     file_path = Path(file_path)
     file_size = file_path.stat().st_size
     stream_salt = os.urandom(24)
@@ -123,6 +126,7 @@ def build_file_v2(
         kyber_ciphertext=kyber_ct
     )
     payload.extend(preamble.pack())
+    yield bytes(payload)
 
     transfer_nonce = os.urandom(16)
     meta = MetadataHeader(
@@ -133,29 +137,27 @@ def build_file_v2(
         file_size=file_size,
     )
     enc_meta = pusher.push(meta.pack())
-    payload.extend(pack_chunk_len(len(enc_meta)) + enc_meta)
+    yield pack_chunk_len(len(enc_meta)) + enc_meta
 
     h = hashlib.sha256()
-    with open(file_path, "rb") as f:
+    async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
             enc = pusher.push_final(b'')
-            payload.extend(pack_chunk_len(len(enc)) + enc)
+            yield pack_chunk_len(len(enc)) + enc
         else:
             while True:
-                chunk = f.read(chunk_size)
+                chunk = await f.read(chunk_size)
                 if not chunk:
                     break
                 if len(chunk) < chunk_size:
                     chunk += b'\x00' * (chunk_size - len(chunk))
                 h.update(chunk)
                 enc = pusher.push(chunk)
-                payload.extend(pack_chunk_len(len(enc)) + enc)
+                yield pack_chunk_len(len(enc)) + enc
             
             sig_file = sign_digest(identity.ed25519_seed, h.digest())
             enc_final = pusher.push_final(sig_file)
-            payload.extend(pack_chunk_len(len(enc_final)) + enc_final)
-            
-    return bytes(payload)
+            yield pack_chunk_len(len(enc_final)) + enc_final
 
 def decrypt_file_v2(
     identity: LocalIdentity,

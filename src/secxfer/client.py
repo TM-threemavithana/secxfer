@@ -1,6 +1,5 @@
 import logging
-import urllib.request
-import json
+import httpx
 from pathlib import Path
 from typing import Optional
 import sys
@@ -57,74 +56,72 @@ class SecXferClient:
         receiver_key_id = key_id_from_x25519_pubkey(pinned_peer_bytes[:32])
 
         logger.info(f"Fetching Pre-Keys from {server_url} for {receiver_name} ({receiver_key_id.hex()})")
-        req = urllib.request.Request(server_url.rstrip("/") + "/keys/" + receiver_key_id.hex())
+        async with httpx.AsyncClient(proxies=self.http_proxy) as http:
+            try:
+                response = await http.get(f"{server_url.rstrip('/')}/keys/{receiver_key_id.hex()}", timeout=10.0)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
 
-        def fetch_keys():
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                return json.loads(response.read().decode())
+            server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
+            
+            try:
+                pinned_peer = self.keystore.get(receiver_key_id)
+            except UnknownSenderError:
+                raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
+            
+            if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+                raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
 
-        try:
-            data = await asyncio.to_thread(fetch_keys)
-        except Exception as exc:
-            raise ProtocolError(f"Failed to fetch keys for {receiver_name} from server: {exc}")
+            receiver_prekey_id = data["prekey"]["id"]
+            receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
 
-        server_ident_bytes = bytes.fromhex(data["identity_pubkey"])
-        
-        try:
-            pinned_peer = self.keystore.get(receiver_key_id)
-        except UnknownSenderError:
-            raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
-        
-        if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
-            raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
-
-        receiver_prekey_id = data["prekey"]["id"]
-        receiver_prekey_pubkey = bytes.fromhex(data["prekey"]["pubkey"])
-
-        payload = build_file_v2(
-            self.identity,
-            receiver_key_id,
-            receiver_prekey_id,
-            receiver_prekey_pubkey,
-            pinned_peer.kyber,
-            file_path,
-            ttl_seconds=ttl_seconds,
-        )
-        
-        logger.info(f"Uploading {len(payload)} encrypted bytes to server...")
-        upload_req = urllib.request.Request(server_url.rstrip("/") + "/upload", data=payload, method="POST")
-        upload_req.add_header("X-Receiver-Key-Id", receiver_key_id.hex())
-        upload_req.add_header("X-Sender-Key-Id", self.identity.key_id.hex())
-        upload_req.add_header("Content-Type", "application/octet-stream")
-        
-        def do_upload():
-            with urllib.request.urlopen(upload_req, timeout=30.0) as resp:
-                return resp.read()
-                
-        await asyncio.to_thread(do_upload)
-        logger.info("Upload complete!")
+            payload_gen = build_file_v2(
+                self.identity,
+                receiver_key_id,
+                receiver_prekey_id,
+                receiver_prekey_pubkey,
+                pinned_peer.kyber,
+                file_path,
+                ttl_seconds=ttl_seconds,
+            )
+            
+            logger.info("Uploading encrypted chunks to server...")
+            headers = {
+                "X-Receiver-Key-Id": receiver_key_id.hex(),
+                "X-Sender-Key-Id": self.identity.key_id.hex(),
+                "Content-Type": "application/octet-stream"
+            }
+            upload_resp = await http.post(
+                f"{server_url.rstrip('/')}/upload",
+                content=payload_gen,
+                headers=headers,
+                timeout=30.0
+            )
+            upload_resp.raise_for_status()
+            logger.info("Upload complete!")
 
     async def check_inbox(self, server_url: str) -> list:
         """Polls the server for pending encrypted files."""
-        req = urllib.request.Request(server_url.rstrip("/") + "/inbox/" + self.identity.key_id.hex())
-        def fetch():
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                return json.loads(response.read().decode())['inbox']
-        return await asyncio.to_thread(fetch)
+        async with httpx.AsyncClient(proxies=self.http_proxy) as http:
+            response = await http.get(f"{server_url.rstrip('/')}/inbox/{self.identity.key_id.hex()}", timeout=10.0)
+            response.raise_for_status()
+            return response.json()['inbox']
 
     async def download(
+        self,
         file_id: int,
         server_url: str,
         dest_path: Path | str
     ) -> None:
         """Downloads and decrypts a pending file."""
         logger.info(f"Downloading file {file_id} from {server_url}...")
-        req = urllib.request.Request(server_url.rstrip("/") + f"/download/{file_id}")
-        def fetch():
-            with urllib.request.urlopen(req, timeout=30.0) as response:
-                return response.read()
+        async with httpx.AsyncClient(proxies=self.http_proxy) as http:
+            response = await http.get(f"{server_url.rstrip('/')}/download/{file_id}", timeout=30.0)
+            response.raise_for_status()
+            ciphertext = response.content
         
-        ciphertext = await asyncio.to_thread(fetch)
         logger.info(f"Downloaded {len(ciphertext)} bytes. Decrypting...")
         
         decrypt_file_v2(
@@ -137,7 +134,13 @@ class SecXferClient:
         )
         logger.info("Decryption complete!")
 
-    def __del__(self):
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         try:
             self.identity.wipe()
         except Exception:
@@ -158,38 +161,32 @@ class SecXferClient:
             "prekeys": prekeys
         }
 
-        def fetch_challenge():
-            req = urllib.request.Request(server_url.rstrip("/") + f"/challenge?key_id={self.identity.key_id.hex()}")
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                return json.loads(response.read().decode())
+        async with httpx.AsyncClient(proxies=self.http_proxy) as http:
+            try:
+                challenge_resp = await http.get(f"{server_url.rstrip('/')}/challenge?key_id={self.identity.key_id.hex()}", timeout=10.0)
+                challenge_resp.raise_for_status()
+                challenge_data = challenge_resp.json()
+                nonce_hex = challenge_data["nonce"]
+            except Exception as exc:
+                raise ProtocolError(f"Failed to fetch PoP challenge from server: {exc}")
 
-        try:
-            challenge_data = await asyncio.to_thread(fetch_challenge)
-            nonce_hex = challenge_data["nonce"]
-        except Exception as exc:
-            raise ProtocolError(f"Failed to fetch PoP challenge from server: {exc}")
+            # Sign the nonce with Ed25519 seed (private key)
+            from nacl.signing import SigningKey
+            sk = SigningKey(self.identity.ed25519_seed)
+            signature = sk.sign(bytes.fromhex(nonce_hex)).signature
+            
+            payload["challenge_nonce"] = nonce_hex
+            payload["signature"] = signature.hex()
 
-        # Sign the nonce with Ed25519 seed (private key)
-        from nacl.signing import SigningKey
-        sk = SigningKey(self.identity.ed25519_seed)
-        signature = sk.sign(bytes.fromhex(nonce_hex)).signature
-        
-        payload["challenge_nonce"] = nonce_hex
-        payload["signature"] = signature.hex()
-
-        req = urllib.request.Request(
-            server_url.rstrip("/") + "/register",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-
-        def do_upload():
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                return json.loads(response.read().decode())
-
-        try:
-            data = await asyncio.to_thread(do_upload)
-            logger.info(f"Successfully registered keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
-            return data
-        except Exception as exc:
-            raise ProtocolError(f"Failed to register keys to server: {exc}")
+            try:
+                reg_resp = await http.post(
+                    f"{server_url.rstrip('/')}/register",
+                    json=payload,
+                    timeout=10.0
+                )
+                reg_resp.raise_for_status()
+                data = reg_resp.json()
+                logger.info(f"Successfully registered keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
+                return data
+            except Exception as exc:
+                raise ProtocolError(f"Failed to register keys to server: {exc}")

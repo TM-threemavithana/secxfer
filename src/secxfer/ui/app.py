@@ -31,6 +31,11 @@ def get_client() -> SecXferClient:
         return app.state.client
     raise HTTPException(status_code=401, detail="Client not initialized. Call /api/unlock.")
 
+@app.on_event("shutdown")
+def shutdown_event():
+    if app.state.client:
+        app.state.client.close()
+
 @app.post("/api/unlock")
 async def unlock(password: str = Form(None)):
     identity_path = app.state.keystore_dir / f"{app.state.identity_name}.key"
@@ -125,15 +130,17 @@ async def download_file(
         return {"error": str(e)}
 
 @app.get("/api/audit")
-async def fetch_audit_log(server_url: str = "http://127.0.0.1:54321"):
-    import urllib.request
-    import json
-    req = urllib.request.Request(server_url.rstrip("/") + "/audit/log")
-    def fetch():
-        with urllib.request.urlopen(req, timeout=10.0) as response:
-            return json.loads(response.read().decode())['log']
+async def fetch_audit_log(
+    server_url: str = "http://127.0.0.1:54321",
+    limit: int = 100,
+    offset: int = 0
+):
+    import httpx
     try:
-        log_data = await asyncio.to_thread(fetch)
+        async with httpx.AsyncClient() as http:
+            response = await http.get(f"{server_url.rstrip('/')}/audit/log?limit={limit}&offset={offset}", timeout=10.0)
+            response.raise_for_status()
+            log_data = response.json()['log']
         return {"status": "ok", "log": log_data}
     except Exception as e:
         return {"error": str(e)}
