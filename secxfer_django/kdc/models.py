@@ -11,6 +11,7 @@ class PreKey(models.Model):
     prekey_id = models.CharField(max_length=64)
     prekey_pubkey = models.CharField(max_length=128)
     used = models.BooleanField(default=False)
+    reserved = models.BooleanField(default=False)  # True while a sender has fetched but not yet uploaded
 
 class EncryptedFile(models.Model):
     sender_key_id = models.CharField(max_length=64)

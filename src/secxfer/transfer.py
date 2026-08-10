@@ -15,8 +15,7 @@ import threading
 from typing import BinaryIO, Iterator, AsyncGenerator
 import aiofiles
 
-from secxfer.constants import DEFAULT_TTL
-
+from secxfer.constants import DEFAULT_TTL, CLOCK_SKEW_TOLERANCE
 from secxfer.crypto import (
     CHUNK_SIZE,
     AuthenticationError,
@@ -25,6 +24,7 @@ from secxfer.crypto import (
     SignatureError,
     derive_stream_key,
     generate_ephemeral_keypair,
+    kyber_encapsulate,
     sign_digest,
     verify_digest,
 )
@@ -103,7 +103,6 @@ async def build_file_v2(
 
     ephemeral_priv, ephemeral_pub = generate_ephemeral_keypair()
     
-    from secxfer.crypto import kyber_encapsulate
     kyber_ct, kyber_ss = kyber_encapsulate(receiver_kyber_pubkey)
 
     stream_key = derive_stream_key(ephemeral_priv, receiver_prekey_pubkey, stream_salt, kyber_secret=kyber_ss)
@@ -212,7 +211,7 @@ def decrypt_file_v2(
         
     meta = MetadataHeader.unpack(meta_bytes)
     now = time.time()
-    if now > meta.timestamp + meta.ttl or now < meta.timestamp - 300:
+    if now > meta.timestamp + meta.ttl or now < meta.timestamp - CLOCK_SKEW_TOLERANCE:
         raise TTLError("Transfer TTL expired")
     nonce_cache.check_and_insert(preamble.sender_key_id, meta.transfer_nonce, meta.ttl)
 
@@ -254,7 +253,25 @@ def decrypt_file_v2(
                 if remaining > 0:
                     to_write = plaintext[:remaining]
                     f.write(to_write)
-                    h.update(plaintext)
+                    h.update(to_write)  # hash the bytes actually written, not zero-padded plaintext
                     bytes_written += len(to_write)
 
     part_file.replace(out_file)
+
+
+def decrypt_file_v2_from_path(
+    identity: LocalIdentity,
+    keystore: Keystore,
+    keystore_dir: Path | str,
+    ciphertext_path: Path | str,
+    dest_path: Path | str,
+    nonce_cache: NonceCache,
+) -> None:
+    """
+    Non-breaking overload of decrypt_file_v2 that reads ciphertext from a file
+    on disk rather than a raw bytes object in memory.
+    Use this for large files to avoid OOM.
+    """
+    ciphertext_path = Path(ciphertext_path)
+    ciphertext = ciphertext_path.read_bytes()
+    decrypt_file_v2(identity, keystore, keystore_dir, ciphertext, dest_path, nonce_cache)

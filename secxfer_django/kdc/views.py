@@ -3,9 +3,10 @@ import os
 import secrets
 import time
 import hashlib
-from django.http import JsonResponse, HttpResponse
+from django.http import JsonResponse, HttpResponse, FileResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.core.cache import cache
+from django.db import transaction
 from nacl.signing import VerifyKey
 from .models import UserIdentity, PreKey, EncryptedFile, AuditLog
 from kdc.constants import CHALLENGE_TTL
@@ -84,12 +85,14 @@ def register_view(request):
 def keys_view(request, key_id):
     try:
         user = UserIdentity.objects.get(key_id=key_id)
-        prekey = user.prekeys.filter(used=False).first()
-        if not prekey:
-            return JsonResponse({"error": "Pre-keys exhausted"}, status=404)
-        
-        prekey.used = True
-        prekey.save()
+        # Atomically reserve the prekey using SELECT FOR UPDATE to prevent
+        # concurrent senders from fetching the same one-time prekey.
+        with transaction.atomic():
+            prekey = user.prekeys.select_for_update().filter(used=False, reserved=False).first()
+            if not prekey:
+                return JsonResponse({"error": "Pre-keys exhausted"}, status=404)
+            prekey.reserved = True
+            prekey.save()
         return JsonResponse({
             "identity_pubkey": user.identity_pubkey,
             "prekey": {"id": prekey.prekey_id, "pubkey": prekey.prekey_pubkey}
@@ -110,13 +113,21 @@ def upload_view(request):
     os.makedirs('server_vault', exist_ok=True)
     file_id = secrets.token_hex(16)
     file_path = os.path.join('server_vault', file_id + ".bin")
-    
-    with open(file_path, 'wb') as f:
-        size = 0
-        for chunk in request:
-            f.write(chunk)
-            size += len(chunk)
-        
+    part_path = file_path + ".part"
+
+    try:
+        with open(part_path, 'wb') as f:
+            size = 0
+            for chunk in request:
+                f.write(chunk)
+                size += len(chunk)
+        # Atomic rename: only committed if full write succeeded
+        os.replace(part_path, file_path)
+    except Exception as e:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        return JsonResponse({"error": f"Upload failed: {e}"}, status=500)
+
     EncryptedFile.objects.create(
         sender_key_id=sender_key_id,
         receiver_key_id=receiver_key_id,
@@ -138,12 +149,11 @@ def download_view(request, file_id):
     try:
         fobj = EncryptedFile.objects.get(id=file_id)
         if not os.path.exists(fobj.file_path):
-            return JsonResponse({"error": "File not found"}, status=404)
+            return JsonResponse({"error": "File not found on disk"}, status=404)
         
         append_audit_log("DOWNLOAD", {"file_id": str(file_id)})
-        
-        with open(fobj.file_path, 'rb') as f:
-            return HttpResponse(f.read(), content_type='application/octet-stream')
+        # FileResponse streams the file in chunks — avoids loading entire file into RAM
+        return FileResponse(open(fobj.file_path, 'rb'), content_type='application/octet-stream')
     except EncryptedFile.DoesNotExist:
         return JsonResponse({"error": "File not found"}, status=404)
 

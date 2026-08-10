@@ -1,11 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-import os
 import shutil
-import asyncio
 
 from secxfer.client import SecXferClient
 from secxfer.keystore import generate_keypair
@@ -14,7 +11,7 @@ app = FastAPI(title="SecXfer UI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,9 +29,9 @@ def get_client() -> SecXferClient:
     raise HTTPException(status_code=401, detail="Client not initialized. Call /api/unlock.")
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():  # async — required to properly await httpx client close
     if app.state.client:
-        app.state.client.close()
+        await app.state.client.aclose()
 
 @app.post("/api/unlock")
 async def unlock(password: str = Form(None)):
@@ -86,7 +83,7 @@ async def register(server_url: str = Form("http://127.0.0.1:54321")):
 
 @app.post("/api/send")
 async def send_file(
-    target_key_id: str = Form(...),
+    receiver_name: str = Form(...),
     file: UploadFile = File(...),
     server_url: str = Form("http://127.0.0.1:54321")
 ):
@@ -98,7 +95,7 @@ async def send_file(
         shutil.copyfileobj(file.file, buffer)
     
     try:
-        await client.send(target_key_id, file_path, server_url)
+        await client.send(receiver_name, file_path, server_url)
         return {"status": "ok"}
     except Exception as e:
         return {"error": str(e)}
