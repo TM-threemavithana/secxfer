@@ -2,106 +2,84 @@
 
 > Client-side encrypted file-transfer security engineering project.
 
-SecXfer explores a three-layer architecture in which cryptographic operations occur in a local client service while a central Django server primarily stores and transports ciphertext.
+SecXfer explores a three-layer file-transfer architecture in which cryptographic operations occur in a local client service while the central Django server primarily stores and transports ciphertext.
 
-The project uses established cryptographic primitives through maintained libraries such as PyNaCl/libsodium and PyCA rather than implementing encryption algorithms from scratch.
+The implementation uses established cryptographic primitives through maintained libraries such as PyNaCl/libsodium and PyCA rather than implementing encryption algorithms from scratch.
 
-However, the surrounding **protocol composition, session-establishment flow, replay-handling design, key-management workflow, and application integration are project-designed and have not undergone an independent cryptographic audit or formal verification**.
+The surrounding **protocol composition, session-establishment flow, replay-handling design, key-management workflow, and application integration are project-designed and have not undergone an independent cryptographic audit or formal verification**.
 
-SecXfer should therefore be treated as an engineering and academic security project, **not as audited production cryptographic software**.
+SecXfer should therefore be treated as a security-engineering and academic project, **not as audited production cryptographic software**.
 
 ---
 
-## Security Scope
+## Security Properties
 
-SecXfer primarily explores protection against:
+| Property | Mechanism | Status / Qualification |
+|---|---|---|
+| Confidentiality | XChaCha20-Poly1305 | Implemented using libsodium |
+| Integrity | AEAD + Ed25519 | Implemented; application integration not independently audited |
+| Authentication | Ed25519 proof of possession | Implemented at application level |
+| Forward secrecy | Ephemeral X25519 session material | Intended property; depends on correct protocol implementation and key lifecycle |
+| Replay mitigation | Persistent nonce tracking | Depends on integrity and persistence of local replay state |
+| Optional PSK hardening | HMAC-SHA256 PSK mixing | Experimental additional secret-key hardening; **not claimed as verified general post-quantum security** |
+| Server-side confidentiality | Client-side encryption | Designed so the central server stores ciphertext rather than private keys/plaintext |
+| Audit tamper evidence | SHA-256 hash chain | Detects modification when compared against trusted state |
 
-- disclosure of plaintext after compromise of central file storage
-- unauthorized modification of encrypted file contents
+---
+
+## Threat Model
+
+The project primarily explores protection against:
+
+- plaintext disclosure following compromise of central storage
+- unauthorized modification of ciphertext
 - replay of previously observed transfers
-- accidental storage of private encryption keys on the central server
-- misuse of identity information during transfer workflows
+- accidental server-side storage of private encryption keys
+- misuse of identity material during transfer workflows
 
-It does **not** claim complete protection against:
+It does not claim complete protection against:
 
 - compromised client operating systems
-- malware reading plaintext or keys from process memory
+- malware reading plaintext or key material from process memory
 - traffic analysis
-- denial-of-service attacks
+- denial-of-service
 - compromised cryptographic dependencies
 - weaknesses in project-designed protocol composition
-- implementation errors outside the underlying cryptographic primitives
 
 ---
 
-## Security Mechanisms
+## Optional PSK Hardening
 
-| Property | Mechanism | Qualification |
-|---|---|---|
-| Confidentiality | XChaCha20-Poly1305 | Authenticated encryption provided through libsodium |
-| Integrity | AEAD + Ed25519 | Protects encrypted content and signed metadata |
-| Authentication | Ed25519 proof of possession | Application-level identity mechanism |
-| Session establishment | X25519 / X3DH-style flow | Project implementation; not independently audited |
-| Forward secrecy | Ephemeral X25519 keys | Depends on correct session implementation and key destruction |
-| Replay mitigation | Persistent nonce tracking | Depends on integrity and persistence of local replay state |
-| Optional PSK mixing | HMAC-SHA256 | Additional protection when a strong PSK is securely provisioned; **not claimed as general post-quantum security** |
-| Audit tamper evidence | SHA-256 hash chain | Detects modification when checked against trusted state |
-| Central-server confidentiality | Client-side encryption | Server is designed to store ciphertext rather than private keys/plaintext |
+SecXfer can mix a pre-shared secret into session-derived key material using HMAC-SHA256.
 
----
-
-## Cryptographic Building Blocks
-
-The implementation uses:
-
-- X25519-based key agreement
-- XChaCha20-Poly1305 authenticated encryption
-- Ed25519 signatures
-- HKDF-SHA256 key derivation
-- password-protected local key storage
-- persistent replay-nonce tracking
-- SHA-256 hash-chain audit verification
-
-These primitives are provided through established cryptographic libraries.
-
-SecXfer does **not** implement its own encryption cipher.
-
----
-
-## Optional PSK Mixing
-
-SecXfer supports mixing a pre-shared secret into session-derived key material using HMAC-SHA256.
-
-A sufficiently strong PSK that is generated, exchanged, stored, and protected independently of the public-key exchange may provide an additional secret unavailable to an attacker who later breaks the asymmetric key exchange.
+If a sufficiently strong PSK is generated, distributed, and stored independently of the asymmetric exchange, it may provide additional secret material unavailable to an attacker who compromises only the public-key mechanism.
 
 However:
 
-- this mechanism has not undergone independent cryptographic analysis
-- secure PSK provisioning remains an external requirement
-- the design should not be described as general-purpose or formally validated post-quantum cryptography
-- no NIST-standard post-quantum KEM is currently being claimed here
+- the construction has not undergone independent cryptographic review
+- secure PSK provisioning is an external assumption
+- the mechanism is not a replacement for standardized post-quantum key-establishment algorithms
+- the project does not claim formal or independently verified post-quantum security
 
-For that reason, the project describes this as **optional PSK hardening**, not verified “post-quantum resistance.”
+For this reason, the feature is described as **optional PSK hardening**, not simply “Post-Quantum Resistance ✅”.
 
 ---
 
 ## Audit Status
 
-SecXfer has **not undergone an independent security or cryptographic audit**.
+SecXfer has **not undergone an independent cryptographic or security audit**.
 
-Security statements in this repository describe the intended behavior and threat model of the implementation. They should not be interpreted as guarantees suitable for production deployment.
+Security statements in this repository describe intended properties and observed implementation behavior. They should not be interpreted as formal guarantees suitable for production deployment.
 
-Independent review of the following would be particularly valuable:
+Independent review would be especially valuable for:
 
 - session establishment
+- identity binding
 - key lifecycle management
 - replay-state handling
-- identity binding
 - protocol message construction
 - error handling
-- local daemon trust assumptions
-
----
+- local-daemon trust assumptions
 
 ## Known Limitations
 
