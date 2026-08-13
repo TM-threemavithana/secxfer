@@ -82,11 +82,8 @@ class LocalIdentity:
     key_id: bytes           # 8 bytes — derived; included in wire preamble
 
     def wipe(self):
-        """Securely zero out the private keys from RAM."""
-        from secxfer.crypto import secure_wipe
-        secure_wipe(self.x25519_privkey)
-        secure_wipe(self.ed25519_seed)
-        secure_wipe(self.kyber_privkey)
+        """Best-effort lifecycle hook; immutable Python keys cannot be wiped in place."""
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +354,15 @@ def load_identity(key_file: Path | str, password: str | None = None) -> LocalIde
     ed25519_pub = bytes(signing_key.verify_key)
     kid = key_id_from_x25519_pubkey(x25519_pub)
     
-    # We must derive Kyber pubkey from privkey or load it from the pub file.
-    # liboqs doesn't easily expose pubkey from privkey without generate_keypair.
-    # Wait, oqs doesn't have a direct pubkey derivation from privkey exposed in Python.
-    # Actually, we can just instantiate the KEM, but let's assume we don't strictly need 
-    # to derive the kyber_pubkey from the private key if we just return dummy for it,
-    # or we can read the corresponding .pub file. For now, we leave it empty.
-    kyber_pub = b"" # Not strictly needed for decrypting/LocalIdentity operations.
+    pub_path = Path(key_file).with_suffix(".pub")
+    if not pub_path.exists():
+        raise FileNotFoundError(f"Matching public key file is required: {pub_path}")
+    public = pub_path.read_bytes()
+    if len(public) != _PUBKEY_SIZE:
+        raise ValueError(f"Expected {_PUBKEY_SIZE}-byte public key file: {pub_path}")
+    if public[:32] != x25519_pub or public[32:64] != ed25519_pub:
+        raise ValueError("Private key does not match its public key file")
+    kyber_pub = public[64:]
 
     return LocalIdentity(
         x25519_privkey=x25519_priv,

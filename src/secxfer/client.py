@@ -1,12 +1,15 @@
 import logging
+import secrets
 import time
 import httpx
 import aiofiles
 from pathlib import Path
 
 from secxfer.constants import DEFAULT_TTL
+from secxfer.crypto import CHUNK_SIZE
 from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError, get_unused_prekeys
 from secxfer.transfer import build_file_v2, decrypt_file_v2, decrypt_file_v2_from_path, NonceCache, ProtocolError
+from secxfer.wire import PREAMBLE_SIZE_V2
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +25,10 @@ class SecXferClient:
         self.identity = load_identity(self.identity_path, password)
         self.keystore = Keystore.from_directory(self.keystore_dir)
         self.nonce_cache = NonceCache(db_path=self.keystore_dir / "nonces.db")
-        proxy = "socks5://127.0.0.1:9050" if use_tor else None
-        # Shared client: enables TCP connection reuse (HTTP keep-alive) across all API calls
-        self._http = httpx.AsyncClient(proxies=proxy)
+        # httpx 0.28+ uses ``proxy`` (singular).  Do not pass a proxy setting
+        # at all for direct connections.
+        http_options = {"proxy": "socks5://127.0.0.1:9050"} if use_tor else {}
+        self._http = httpx.AsyncClient(**http_options)
         
         self.identity_name = self.identity_path.stem
         
@@ -36,17 +40,34 @@ class SecXferClient:
         self.keystore = Keystore.from_directory(self.keystore_dir)
         logger.info(f"Keystore refreshed: {len(self.keystore)} peer(s) loaded from {self.keystore_dir}")
 
-    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
-        """Create a short-lived Ed25519 proof for KDC operations."""
+    def _auth_headers(self, method: str, path: str, context: str = "") -> dict[str, str]:
+        """Create a one-time Ed25519 proof bound to request metadata."""
         from nacl.signing import SigningKey
         timestamp = str(int(time.time()))
-        message = f"{method.upper()}\n{path}\n{timestamp}".encode("utf-8")
+        nonce = secrets.token_hex(16)
+        message = f"{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{context}".encode("utf-8")
         signature = SigningKey(self.identity.ed25519_seed).sign(message).signature.hex()
         return {
             "X-Auth-Key-Id": self.identity.key_id.hex(),
             "X-Auth-Timestamp": timestamp,
+            "X-Auth-Nonce": nonce,
             "X-Auth-Signature": signature,
         }
+
+    @staticmethod
+    def _payload_size(file_path: Path) -> int:
+        """Return the exact wire size emitted by build_file_v2's default chunks."""
+        file_size = file_path.stat().st_size
+        metadata_size = 38 + len(file_path.name.encode("utf-8"))
+        metadata_frame = 4 + metadata_size + 17
+        trailer_frame = 4 + 64 + 17
+        if file_size == 0:
+            return 1 + PREAMBLE_SIZE_V2 + metadata_frame + trailer_frame
+        full_chunks, remainder = divmod(file_size, CHUNK_SIZE)
+        data_frame_size = full_chunks * (4 + CHUNK_SIZE + 17)
+        if remainder:
+            data_frame_size += 4 + remainder + 17
+        return 1 + PREAMBLE_SIZE_V2 + metadata_frame + data_frame_size + trailer_frame
 
     async def send(
         self,
@@ -71,7 +92,8 @@ class SecXferClient:
 
         logger.info(f"Fetching Pre-Keys from {server_url} for {receiver_name} ({receiver_key_id.hex()})")
         try:
-            response = await self._http.get(f"{server_url.rstrip('/')}/keys/{receiver_key_id.hex()}", timeout=10.0)
+            path = f"/keys/{receiver_key_id.hex()}"
+            response = await self._http.get(f"{server_url.rstrip('/')}{path}", headers=self._auth_headers("GET", path), timeout=10.0)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
@@ -105,9 +127,11 @@ class SecXferClient:
             "X-Receiver-Key-Id": receiver_key_id.hex(),
             "X-Sender-Key-Id": self.identity.key_id.hex(),
             "X-Prekey-Id": receiver_prekey_id,  # server uses this to finally burn the prekey on upload
-            "Content-Type": "application/octet-stream"
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(self._payload_size(file_path)),
         }
-        headers.update(self._auth_headers("POST", "/upload"))
+        context = f"{self.identity.key_id.hex()}\n{receiver_key_id.hex()}\n{receiver_prekey_id}\n{headers['Content-Length']}"
+        headers.update(self._auth_headers("POST", "/upload", context))
         upload_resp = await self._http.post(
             f"{server_url.rstrip('/')}/upload",
             content=payload_gen,

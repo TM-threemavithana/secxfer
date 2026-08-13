@@ -1,4 +1,5 @@
 import multiprocessing
+import queue as queue_module
 import tempfile
 from pathlib import Path
 from secxfer.keystore import generate_keypair, consume_prekey, get_unused_prekeys
@@ -46,8 +47,11 @@ def test_atomic_prekey_consumption_concurrency():
             p.join()
             
         results = []
-        while not queue.empty():
-            results.append(queue.get())
+        for _ in processes:
+            try:
+                results.append(queue.get(timeout=5))
+            except queue_module.Empty as exc:
+                raise AssertionError("A worker exited without reporting its result") from exc
             
         successes = results.count("SUCCESS")
         burns = results.count("BURNED")

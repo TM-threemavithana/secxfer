@@ -51,18 +51,41 @@ def _authenticate_request(request):
     """Validate a short-lived request signature from an already registered identity."""
     key_id = request.headers.get("X-Auth-Key-Id")
     timestamp = request.headers.get("X-Auth-Timestamp")
+    nonce = request.headers.get("X-Auth-Nonce")
     signature = request.headers.get("X-Auth-Signature")
-    if not key_id or not timestamp or not signature:
+    if not key_id or not timestamp or not nonce or not signature:
         return None
     try:
-        if abs(time.time() - int(timestamp)) > 60:
+        if abs(time.time() - int(timestamp)) > 60 or len(nonce) != 32:
+            return None
+        # ``add`` is atomic for the configured Django cache backend.  It makes
+        # a signed request single-use during its validity window.
+        if not cache.add(f"request-nonce:{key_id}:{nonce}", True, timeout=60):
             return None
         identity = UserIdentity.objects.get(key_id=key_id)
-        message = f"{request.method}\n{request.path}\n{timestamp}".encode("utf-8")
+        context = ""
+        if request.path == "/upload":
+            context = "\n".join([
+                request.headers.get("X-Sender-Key-Id", ""),
+                request.headers.get("X-Receiver-Key-Id", ""),
+                request.headers.get("X-Prekey-Id", ""),
+                request.headers.get("Content-Length", ""),
+            ])
+        message = f"{request.method}\n{request.path}\n{timestamp}\n{nonce}\n{context}".encode("utf-8")
         VerifyKey(bytes.fromhex(identity.identity_pubkey)[32:64]).verify(message, bytes.fromhex(signature))
         return identity
     except Exception:
         return None
+
+def _prekey_request_allowed(identity: UserIdentity) -> bool:
+    """Limit one authenticated caller from reserving a user's key pool."""
+    bucket = f"prekey-rate:{identity.key_id}:{int(time.time() // 60)}"
+    if cache.add(bucket, 1, timeout=61):
+        return True
+    try:
+        return cache.incr(bucket) <= 10
+    except ValueError:
+        return False
 
 def challenge_view(request):
     key_id = request.GET.get('key_id')
@@ -88,30 +111,56 @@ def register_view(request):
     if not pending_nonce or pending_nonce != challenge_nonce or not _verify_pop(identity_pubkey, challenge_nonce, signature):
         return JsonResponse({"error": "Auth failed"}, status=401)
 
-    user, created = UserIdentity.objects.update_or_create(
-        key_id=key_id,
-        defaults={"identity_pubkey": identity_pubkey, "registered_at": time.time()}
-    )
-    for pk in prekeys:
-        PreKey.objects.create(user=user, prekey_id=pk['id'], prekey_pubkey=pk['pubkey'])
+    try:
+        identity_bytes = bytes.fromhex(identity_pubkey)
+        if hashlib.sha256(identity_bytes[:32]).digest()[:16].hex() != key_id:
+            return JsonResponse({"error": "key_id does not match identity key"}, status=400)
+        if len({pk["id"] for pk in prekeys}) != len(prekeys):
+            return JsonResponse({"error": "Duplicate prekey IDs"}, status=400)
+        for pk in prekeys:
+            if len(pk["id"]) > 64 or len(bytes.fromhex(pk["pubkey"])) != 32:
+                return JsonResponse({"error": "Invalid prekey bundle"}, status=400)
+    except (KeyError, TypeError, ValueError):
+        return JsonResponse({"error": "Invalid key bundle"}, status=400)
+
+    with transaction.atomic():
+        user, created = UserIdentity.objects.get_or_create(
+            key_id=key_id, defaults={"identity_pubkey": identity_pubkey, "registered_at": time.time()}
+        )
+        if not created and user.identity_pubkey != identity_pubkey:
+            return JsonResponse({"error": "Identity key rotation requires an explicit recovery flow"}, status=409)
+        added = 0
+        for pk in prekeys:
+            existing, was_created = PreKey.objects.get_or_create(
+                user=user, prekey_id=pk["id"], defaults={"prekey_pubkey": pk["pubkey"]}
+            )
+            if not was_created and existing.prekey_pubkey != pk["pubkey"]:
+                return JsonResponse({"error": "Prekey ID conflicts with existing key material"}, status=409)
+            added += was_created
         
-    append_audit_log("REGISTER", {"key_id": key_id, "prekeys_added": len(prekeys)})
-    return JsonResponse({"status": "registered", "prekeys_added": len(prekeys)})
+    append_audit_log("REGISTER", {"key_id": key_id, "prekeys_added": added})
+    return JsonResponse({"status": "registered", "prekeys_added": added})
 
 def keys_view(request, key_id):
     try:
+        requester = _authenticate_request(request)
+        if not requester:
+            return JsonResponse({"error": "Authentication required"}, status=401)
+        if not _prekey_request_allowed(requester):
+            return JsonResponse({"error": "Prekey request rate limit exceeded"}, status=429)
         user = UserIdentity.objects.get(key_id=key_id)
         # Atomically reserve the prekey using SELECT FOR UPDATE to prevent
         # concurrent senders from fetching the same one-time prekey.
         with transaction.atomic():
             # Reclaim a reservation only after a short timeout.
-            PreKey.objects.filter(user=user, reserved=True, used=False, reserved_at__lt=time.time() - 300).update(reserved=False, reserved_at=None)
+            PreKey.objects.filter(user=user, reserved=True, used=False, reserved_at__lt=time.time() - 300).update(reserved=False, reserved_at=None, reserved_by_key_id=None)
             prekey = user.prekeys.select_for_update().filter(used=False, reserved=False).first()
             if not prekey:
                 return JsonResponse({"error": "Pre-keys exhausted"}, status=404)
             prekey.reserved = True
             prekey.reserved_at = time.time()
-            prekey.save(update_fields=["reserved", "reserved_at"])
+            prekey.reserved_by_key_id = requester.key_id
+            prekey.save(update_fields=["reserved", "reserved_at", "reserved_by_key_id"])
         return JsonResponse({
             "identity_pubkey": user.identity_pubkey,
             "prekey": {"id": prekey.prekey_id, "pubkey": prekey.prekey_pubkey}
@@ -161,11 +210,12 @@ def upload_view(request):
 
     try:
         with transaction.atomic():
-            prekey = PreKey.objects.select_for_update().get(user__key_id=receiver_key_id, prekey_id=prekey_id, reserved=True, used=False)
+            prekey = PreKey.objects.select_for_update().get(user__key_id=receiver_key_id, prekey_id=prekey_id, reserved=True, reserved_by_key_id=sender_key_id, used=False)
             prekey.used = True
             prekey.reserved = False
             prekey.reserved_at = None
-            prekey.save(update_fields=["used", "reserved", "reserved_at"])
+            prekey.reserved_by_key_id = None
+            prekey.save(update_fields=["used", "reserved", "reserved_at", "reserved_by_key_id"])
             EncryptedFile.objects.create(sender_key_id=sender_key_id, receiver_key_id=receiver_key_id, file_path=file_path, timestamp=time.time(), size=size)
     except PreKey.DoesNotExist:
         if os.path.exists(file_path):

@@ -23,9 +23,8 @@ from __future__ import annotations
 # Secure Memory Management
 # ---------------------------------------------------------------------------
 import ctypes
-import sys
 
-def secure_wipe(b: bytes) -> None:
+def secure_wipe(b: bytearray | memoryview) -> None:
     """
     Overwrite key material with zeros using libsodium's guaranteed-not-to-be-
     optimized-away sodium_memzero, which is immune to compiler dead-store
@@ -35,20 +34,13 @@ def secure_wipe(b: bytes) -> None:
     (pre-1.4). The ctypes path uses the CPython bytes layout heuristic and is
     unreliable on PyPy — prefer upgrading PyNaCl.
     """
-    if not isinstance(b, bytes) or len(b) == 0:
+    if not isinstance(b, (bytearray, memoryview)):
+        raise TypeError("secure_wipe requires mutable key material")
+    if len(b) == 0:
         return
-    try:
-        # PyNaCl >= 1.4 exposes sodium_memzero directly
-        import nacl.bindings as _nb_wipe
-        # Create a mutable copy via ctypes, zero it, then let it be GC'd.
-        # The canonical approach for immutable bytes in CPython.
-        buf = (ctypes.c_char * len(b)).from_buffer_copy(b)
-        _nb_wipe.sodium_memzero(buf)
-    except (AttributeError, TypeError):
-        # Fallback: CPython bytes layout heuristic (version-specific offset)
-        offset = 32 if sys.maxsize > 2**32 else 16
-        buf_addr = id(b) + offset
-        ctypes.memset(buf_addr, 0, len(b))
+    import nacl.bindings as _nb_wipe
+    buf = (ctypes.c_char * len(b)).from_buffer(b)
+    _nb_wipe.sodium_memzero(buf)
 
 import hashlib
 import os

@@ -151,7 +151,9 @@ $('inbox-form').addEventListener('submit', async (e) => {
     btn.disabled = true;
 
     try {
-        const res = await fetch(`/api/inbox?server_url=${encodeURIComponent(server_url)}`);
+        const fd = new FormData();
+        fd.append('server_url', server_url);
+        const res = await fetch('/api/inbox', { method: 'POST', body: fd });
         const data = await res.json();
         if (data.error) {
             log(`Inbox check failed: ${data.error}`, "error");

@@ -13,6 +13,10 @@ class PreKey(models.Model):
     used = models.BooleanField(default=False)
     reserved = models.BooleanField(default=False)  # True while a sender has fetched but not yet uploaded
     reserved_at = models.FloatField(null=True, blank=True)  # Unix timestamp of reservation; None if not reserved
+    reserved_by_key_id = models.CharField(max_length=64, null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "prekey_id"], name="unique_prekey_per_user")]
 
 class EncryptedFile(models.Model):
     sender_key_id = models.CharField(max_length=64)

@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import shutil
+import uuid
 
 from secxfer.client import SecXferClient
 from secxfer.keystore import generate_keypair
@@ -92,9 +93,11 @@ async def send_file(
     client = get_client()
     temp_dir = app.state.keystore_dir / "tmp"
     temp_dir.mkdir(exist_ok=True)
-    file_path = temp_dir / file.filename
+    # Never derive a filesystem path from a client-supplied filename.
+    file_path = temp_dir / f"{uuid.uuid4().hex}.upload"
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    await file.close()
     
     try:
         await client.send(receiver_name, file_path, server_url)
@@ -106,7 +109,7 @@ async def send_file(
             file_path.unlink()
 
 @app.post("/api/inbox")
-async def check_inbox(server_url: str = "http://127.0.0.1:54321"):
+async def check_inbox(server_url: str = Form("http://127.0.0.1:54321")):
     client = get_client()
     try:
         inbox = await client.check_inbox(server_url)
