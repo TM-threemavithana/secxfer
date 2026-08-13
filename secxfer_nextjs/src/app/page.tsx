@@ -10,6 +10,10 @@ type InboxItem = { file_id: string; sender_key_id: string; timestamp: number; si
 type AuditEntry = { id: number; event_type: string; details_raw: string; previous_hash: string; current_hash: string; timestamp: number };
 type StatusData = { identity_name?: string; key_id?: string; prekeys_available?: number; status?: string };
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unexpected error";
+}
+
 // ── Error Boundary ──────────────────────────────────────────────────────────
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; message: string }> {
   constructor(props: { children: ReactNode }) {
@@ -78,8 +82,8 @@ export default function Home() {
       } else {
         log("Unlock failed: " + (data.error || "Wrong password"), "error");
       }
-    } catch (err: any) {
-      log(`Connection error: ${err.message}`, "error");
+    } catch (err: unknown) {
+      log(`Connection error: ${errorMessage(err)}`, "error");
     }
   };
 
@@ -92,7 +96,7 @@ export default function Home() {
         setStatus(data);
         fetchInbox();
       }
-    } catch (e) {}
+    } catch {}
   };
 
   const fetchInbox = async () => {
@@ -103,7 +107,7 @@ export default function Home() {
       if (!res.ok) throw new Error(`Server returned status ${res.status}`);
       const data = await res.json();
       if (data.inbox) setInbox(data.inbox);
-    } catch (e) {}
+    } catch {}
   };
 
   useEffect(() => {
@@ -111,6 +115,8 @@ export default function Home() {
     checkStatus();
     const interval = setInterval(checkStatus, 5000);
     return () => clearInterval(interval);
+  // checkStatus is intentionally invoked only when the unlock state changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unlocked]);
 
   const handleSend = async (e: React.FormEvent) => {
@@ -146,8 +152,8 @@ export default function Home() {
         xhr.onerror = () => reject(new Error("Network error"));
         xhr.send(formData);
       });
-    } catch (err: any) {
-      log(`Failed: ${err.message}`, "error");
+    } catch (err: unknown) {
+      log(`Failed: ${errorMessage(err)}`, "error");
     } finally {
       setSending(false);
       setUploadProgress(0);
@@ -204,8 +210,8 @@ export default function Home() {
         log(`Verified ${allLogs.length} blocks locally in browser. No tampering detected. Chain is intact.`, "success");
       }
       setAuditStatus("ok");
-    } catch (err: any) {
-      log(`Audit verification error: ${err.message}`, "error");
+    } catch (err: unknown) {
+      log(`Audit verification error: ${errorMessage(err)}`, "error");
       setAuditStatus("fail");
     }
   };
@@ -221,7 +227,7 @@ export default function Home() {
       const data = await res.json();
       if (data.status === "ok") { log(`File #${file_id} decrypted and saved to downloads folder.`, "success"); fetchInbox(); }
       else { log(`Error: ${data.error}`, "error"); }
-    } catch (e: any) { log(`Failed: ${e.message}`, "error"); }
+    } catch (e: unknown) { log(`Failed: ${errorMessage(e)}`, "error"); }
   };
 
   const logColor = { info: "text-slate-400", success: "text-emerald-400", error: "text-red-400", warn: "text-amber-400" };
@@ -379,13 +385,13 @@ export default function Home() {
                   <div className="flex justify-between items-center mb-6">
                     <div>
                       <h2 className="text-xl font-bold">Hash-Chained Audit Log</h2>
-                      <p className="text-slate-400 text-sm">Verified locally in your browser via Web Crypto API. Server cannot fake this.</p>
+                      <p className="text-slate-400 text-sm">Verified locally in your browser via Web Crypto API. Compare chain heads over time for independent tamper evidence.</p>
                     </div>
                   </div>
                   {auditLogs.length === 0 ? (
                     <div className="text-center py-16 text-slate-600">
                       <div className="text-5xl mb-3">⛓</div>
-                      <p>Click "Verify Server Integrity" to load the audit log</p>
+                      <p>Click &quot;Verify Server Integrity&quot; to load the audit log</p>
                     </div>
                   ) : (
                     <div className="space-y-2">

@@ -39,13 +39,15 @@ async def unlock(password: str = Form(None)):
     if not identity_path.exists():
         return {"error": "Identity not found"}
     try:
+        if app.state.client:
+            await app.state.client.aclose()
         app.state.client = SecXferClient(
             identity_path, 
             app.state.keystore_dir, 
             password=password, 
             use_tor=app.state.use_tor
         )
-        return {"status": "ok", "key_id": app.state.client.identity.key_id.hex()}
+        return {"status": "unlocked", "key_id": app.state.client.identity.key_id.hex()}
     except Exception as e:
         return {"error": str(e)}
 
@@ -70,7 +72,7 @@ async def status():
     exists = identity_path.exists()
     unlocked = app.state.client is not None
     key_id = app.state.client.identity.key_id.hex() if unlocked else None
-    return {"exists": exists, "unlocked": unlocked, "key_id": key_id}
+    return {"status": "ok", "exists": exists, "unlocked": unlocked, "key_id": key_id, "identity_name": app.state.identity_name}
 
 @app.post("/api/register")
 async def register(server_url: str = Form("http://127.0.0.1:54321")):
@@ -103,7 +105,7 @@ async def send_file(
         if file_path.exists():
             file_path.unlink()
 
-@app.get("/api/inbox")
+@app.post("/api/inbox")
 async def check_inbox(server_url: str = "http://127.0.0.1:54321"):
     client = get_client()
     try:
@@ -132,12 +134,9 @@ async def fetch_audit_log(
     limit: int = 100,
     offset: int = 0
 ):
-    import httpx
+    client = get_client()
     try:
-        async with httpx.AsyncClient() as http:
-            response = await http.get(f"{server_url.rstrip('/')}/audit/log?limit={limit}&offset={offset}", timeout=10.0)
-            response.raise_for_status()
-            log_data = response.json()['log']
+        log_data = await client.get_audit_log(server_url, limit=limit, offset=offset)
         return {"status": "ok", "log": log_data}
     except Exception as e:
         return {"error": str(e)}

@@ -378,18 +378,18 @@ class WrongPasswordError(Exception):
 
 def encrypt_private_key(privkey_data: bytes, password: str, duress_password: str | None = None, fake_privkey_data: bytes | None = None) -> bytes:
     """
-    Encrypt a private key using Argon2i for key derivation and XSalsa20-Poly1305.
-    Implements Plausible Deniability by storing two indistinguishable slots.
-    Total length = 240 bytes (Slot 1: 120 bytes, Slot 2: 120 bytes).
+    Encrypt a private key using Argon2id for key derivation and XSalsa20-Poly1305.
+    Implements plausible deniability by storing two equally sized slots.  The
+    format supports the full hybrid private identity, not only 64-byte keys.
     """
     def _encrypt_slot(data: bytes, pwd: str) -> bytes:
-        salt = nacl.utils.random(nacl.pwhash.argon2i.SALTBYTES)
-        key = nacl.pwhash.argon2i.kdf(
+        salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+        key = nacl.pwhash.argon2id.kdf(
             nacl.secret.SecretBox.KEY_SIZE,
             pwd.encode('utf-8'),
             salt,
-            opslimit=nacl.pwhash.argon2i.OPSLIMIT_INTERACTIVE,
-            memlimit=nacl.pwhash.argon2i.MEMLIMIT_INTERACTIVE,
+            opslimit=nacl.pwhash.argon2id.OPSLIMIT_INTERACTIVE,
+            memlimit=nacl.pwhash.argon2id.MEMLIMIT_INTERACTIVE,
         )
         box = nacl.secret.SecretBox(key)
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
@@ -401,8 +401,8 @@ def encrypt_private_key(privkey_data: bytes, password: str, duress_password: str
     if duress_password and fake_privkey_data:
         slot2 = _encrypt_slot(fake_privkey_data, duress_password)
     else:
-        # Fill slot 2 with completely random noise
-        slot2 = os.urandom(120)
+        # Keep both slots exactly the same size so their purpose is not leaked.
+        slot2 = os.urandom(len(slot1))
 
     return slot1 + slot2
 
@@ -412,44 +412,38 @@ def decrypt_private_key(encrypted_data: bytes, password: str) -> bytes:
     Attempts to decrypt both slots. If the real password is provided, slot 1 decrypts.
     If the duress password is provided, slot 2 decrypts.
     """
-    # Legacy check for the old format (88 bytes for 32-byte key, or 120 bytes for 64-byte key)
-    # The new deniable format is exactly 240 bytes.
-    if len(encrypted_data) != 240:
-        if len(encrypted_data) < nacl.pwhash.argon2i.SALTBYTES + nacl.secret.SecretBox.NONCE_SIZE + 16:
-            raise WrongPasswordError("Invalid or corrupted private key file.")
-        
-        # Legacy fallback
-        salt = encrypted_data[:nacl.pwhash.argon2i.SALTBYTES]
-        ciphertext = encrypted_data[nacl.pwhash.argon2i.SALTBYTES:]
-        key = nacl.pwhash.argon2i.kdf(
-            nacl.secret.SecretBox.KEY_SIZE,
-            password.encode('utf-8'),
-            salt,
-            opslimit=nacl.pwhash.argon2i.OPSLIMIT_INTERACTIVE,
-            memlimit=nacl.pwhash.argon2i.MEMLIMIT_INTERACTIVE,
-        )
-        box = nacl.secret.SecretBox(key)
-        try:
-            return box.decrypt(ciphertext)
-        except _NaClCryptoError as exc:
-            raise WrongPasswordError("Incorrect password.") from exc
+    min_slot = nacl.pwhash.argon2id.SALTBYTES + nacl.secret.SecretBox.NONCE_SIZE + 16
+    if len(encrypted_data) < min_slot:
+        raise WrongPasswordError("Invalid or corrupted private key file.")
 
-    # New Deniable Format (240 bytes)
-    slots = [encrypted_data[:120], encrypted_data[120:]]
-    for slot in slots:
-        salt = slot[:nacl.pwhash.argon2i.SALTBYTES]
-        ciphertext = slot[nacl.pwhash.argon2i.SALTBYTES:]
-        key = nacl.pwhash.argon2i.kdf(
-            nacl.secret.SecretBox.KEY_SIZE,
-            password.encode('utf-8'),
-            salt,
-            opslimit=nacl.pwhash.argon2i.OPSLIMIT_INTERACTIVE,
-            memlimit=nacl.pwhash.argon2i.MEMLIMIT_INTERACTIVE,
-        )
-        box = nacl.secret.SecretBox(key)
-        try:
-            return box.decrypt(ciphertext)
-        except _NaClCryptoError:
-            continue
-            
-    raise WrongPasswordError("Incorrect password (both slots failed).")
+    # New files contain two equal slots.  Also accept the earlier malformed
+    # hybrid layout, which appended a fixed 120-byte noise slot.
+    slot_sizes = []
+    if len(encrypted_data) % 2 == 0:
+        slot_sizes.append(len(encrypted_data) // 2)
+    if len(encrypted_data) > 120:
+        slot_sizes.append(len(encrypted_data) - 120)
+    slot_sizes.append(len(encrypted_data))  # pre-deniability legacy file
+
+    def _decrypt_slot(slot: bytes) -> bytes | None:
+        if len(slot) < min_slot:
+            return None
+        salt, ciphertext = slot[:nacl.pwhash.argon2id.SALTBYTES], slot[nacl.pwhash.argon2id.SALTBYTES:]
+        for algorithm in (nacl.pwhash.argon2id, nacl.pwhash.argon2i):
+            try:
+                key = algorithm.kdf(
+                    nacl.secret.SecretBox.KEY_SIZE, password.encode("utf-8"), salt,
+                    opslimit=algorithm.OPSLIMIT_INTERACTIVE, memlimit=algorithm.MEMLIMIT_INTERACTIVE,
+                )
+                return nacl.secret.SecretBox(key).decrypt(ciphertext)
+            except _NaClCryptoError:
+                continue
+        return None
+
+    for slot_size in dict.fromkeys(slot_sizes):
+        for start in range(0, len(encrypted_data), slot_size):
+            plaintext = _decrypt_slot(encrypted_data[start:start + slot_size])
+            if plaintext is not None:
+                return plaintext
+             
+    raise WrongPasswordError("Incorrect password or corrupted private key.")

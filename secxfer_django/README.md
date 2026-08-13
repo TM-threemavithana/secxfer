@@ -39,6 +39,7 @@ The server **never receives, stores, or processes** any plaintext or private key
 python manage.py migrate
 
 # Start server
+export DJANGO_SECRET_KEY='replace-with-a-long-random-secret'
 python manage.py runserver 8001
 ```
 
@@ -74,4 +75,4 @@ Block N:
   current_hash  : SHA-256(event_type + "|" + details + "|" + timestamp + "|" + previous_hash)
 ```
 
-**Verification is Zero-Trust:** The client browser fetches the raw chain and re-computes every SHA-256 locally via `window.crypto.subtle`. The server cannot lie — if any block is tampered, the computed hash will not match, and the client displays a `SERVER TAMPERING DETECTED` alert.
+**Verification is tamper-evident:** The client browser fetches the raw chain and re-computes every SHA-256 locally via `window.crypto.subtle`. It detects modified, reordered, or missing entries relative to a previously trusted chain head. For independent protection against a compromised server rewriting its entire history, periodically publish signed chain-head checkpoints to an external append-only system.

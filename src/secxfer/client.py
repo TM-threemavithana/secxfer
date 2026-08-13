@@ -1,9 +1,10 @@
 import logging
+import time
 import httpx
 import aiofiles
 from pathlib import Path
-from typing import Optional
 
+from secxfer.constants import DEFAULT_TTL
 from secxfer.keystore import Keystore, load_identity, key_id_from_x25519_pubkey, UnknownSenderError, get_unused_prekeys
 from secxfer.transfer import build_file_v2, decrypt_file_v2, decrypt_file_v2_from_path, NonceCache, ProtocolError
 
@@ -35,12 +36,24 @@ class SecXferClient:
         self.keystore = Keystore.from_directory(self.keystore_dir)
         logger.info(f"Keystore refreshed: {len(self.keystore)} peer(s) loaded from {self.keystore_dir}")
 
+    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
+        """Create a short-lived Ed25519 proof for KDC operations."""
+        from nacl.signing import SigningKey
+        timestamp = str(int(time.time()))
+        message = f"{method.upper()}\n{path}\n{timestamp}".encode("utf-8")
+        signature = SigningKey(self.identity.ed25519_seed).sign(message).signature.hex()
+        return {
+            "X-Auth-Key-Id": self.identity.key_id.hex(),
+            "X-Auth-Timestamp": timestamp,
+            "X-Auth-Signature": signature,
+        }
+
     async def send(
         self,
         receiver_name: str,
         file_path: Path | str,
         server_url: str,
-        ttl_seconds: int = 300,
+        ttl_seconds: int = DEFAULT_TTL,
     ) -> None:
         """
         Sends an encrypted file to the central server (Store-and-Forward).
@@ -71,7 +84,7 @@ class SecXferClient:
         except UnknownSenderError:
             raise ProtocolError(f"Receiver {receiver_name} is not loaded in Keystore!")
         
-        if (pinned_peer.x25519 + pinned_peer.ed25519) != server_ident_bytes:
+        if (pinned_peer.x25519 + pinned_peer.ed25519 + pinned_peer.kyber) != server_ident_bytes:
             raise ProtocolError(f"CRITICAL: Server returned a different identity key for {receiver_name} than your pinned version! MITM attack detected.")
 
         receiver_prekey_id = data["prekey"]["id"]
@@ -91,8 +104,10 @@ class SecXferClient:
         headers = {
             "X-Receiver-Key-Id": receiver_key_id.hex(),
             "X-Sender-Key-Id": self.identity.key_id.hex(),
+            "X-Prekey-Id": receiver_prekey_id,  # server uses this to finally burn the prekey on upload
             "Content-Type": "application/octet-stream"
         }
+        headers.update(self._auth_headers("POST", "/upload"))
         upload_resp = await self._http.post(
             f"{server_url.rstrip('/')}/upload",
             content=payload_gen,
@@ -104,9 +119,16 @@ class SecXferClient:
 
     async def check_inbox(self, server_url: str) -> list:
         """Polls the server for pending encrypted files."""
-        response = await self._http.get(f"{server_url.rstrip('/')}/inbox/{self.identity.key_id.hex()}", timeout=10.0)
+        path = f"/inbox/{self.identity.key_id.hex()}"
+        response = await self._http.get(f"{server_url.rstrip('/')}{path}", headers=self._auth_headers("GET", path), timeout=10.0)
         response.raise_for_status()
         return response.json()['inbox']
+
+    async def get_audit_log(self, server_url: str, limit: int = 100, offset: int = 0) -> list:
+        path = f"/audit/log?limit={limit}&offset={offset}"
+        response = await self._http.get(f"{server_url.rstrip('/')}{path}", headers=self._auth_headers("GET", "/audit/log"), timeout=10.0)
+        response.raise_for_status()
+        return response.json()["log"]
 
     async def download(
         self,
@@ -121,7 +143,8 @@ class SecXferClient:
         tmp_path = tmp_dir / f"download_{file_id}.bin"
 
         try:
-            async with self._http.stream("GET", f"{server_url.rstrip('/')}/download/{file_id}", timeout=None) as response:
+            path = f"/download/{file_id}"
+            async with self._http.stream("GET", f"{server_url.rstrip('/')}{path}", headers=self._auth_headers("GET", path), timeout=None) as response:
                 response.raise_for_status()
                 async with aiofiles.open(tmp_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size=65536):
@@ -133,7 +156,8 @@ class SecXferClient:
                 self.identity_path.parent,
                 tmp_path,
                 dest_path,
-                self.nonce_cache
+                self.nonce_cache,
+                self.identity_name,
             )
         finally:
             if tmp_path.exists():
@@ -172,36 +196,33 @@ class SecXferClient:
 
         payload = {
             "key_id": self.identity.key_id.hex(),
-            "identity_pubkey": (self.identity.x25519_pubkey + self.identity.ed25519_pubkey).hex(),
+            "identity_pubkey": (self.identity.x25519_pubkey + self.identity.ed25519_pubkey + self.identity.kyber_pubkey).hex(),
             "prekeys": prekeys
         }
 
-        async with self._http as http:
-            try:
-                challenge_resp = await http.get(f"{server_url.rstrip('/')}/challenge?key_id={self.identity.key_id.hex()}", timeout=10.0)
-                challenge_resp.raise_for_status()
-                challenge_data = challenge_resp.json()
-                nonce_hex = challenge_data["nonce"]
-            except Exception as exc:
-                raise ProtocolError(f"Failed to fetch PoP challenge from server: {exc}")
+        try:
+            challenge_resp = await self._http.get(f"{server_url.rstrip('/')}/challenge?key_id={self.identity.key_id.hex()}", timeout=10.0)
+            challenge_resp.raise_for_status()
+            challenge_data = challenge_resp.json()
+            nonce_hex = challenge_data["nonce"]
+        except Exception as exc:
+            raise ProtocolError(f"Failed to fetch PoP challenge from server: {exc}")
 
-            # Sign the nonce with Ed25519 seed (private key)
-            from nacl.signing import SigningKey
-            sk = SigningKey(self.identity.ed25519_seed)
-            signature = sk.sign(bytes.fromhex(nonce_hex)).signature
+        # Sign the nonce with Ed25519 seed (private key)
+        from nacl.signing import SigningKey
+        sk = SigningKey(self.identity.ed25519_seed)
+        signature = sk.sign(bytes.fromhex(nonce_hex)).signature
             
-            payload["challenge_nonce"] = nonce_hex
-            payload["signature"] = signature.hex()
+        payload["challenge_nonce"] = nonce_hex
+        payload["signature"] = signature.hex()
 
-            try:
-                reg_resp = await http.post(
-                    f"{server_url.rstrip('/')}/register",
-                    json=payload,
-                    timeout=10.0
-                )
-                reg_resp.raise_for_status()
-                data = reg_resp.json()
-                logger.info(f"Successfully registered keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
-                return data
-            except Exception as exc:
-                raise ProtocolError(f"Failed to register keys to server: {exc}")
+        try:
+            reg_resp = await self._http.post(
+                f"{server_url.rstrip('/')}/register", json=payload, timeout=10.0
+            )
+            reg_resp.raise_for_status()
+            data = reg_resp.json()
+            logger.info(f"Successfully registered keys to {server_url}. Added {data.get('prekeys_added')} prekeys.")
+            return data
+        except Exception as exc:
+            raise ProtocolError(f"Failed to register keys to server: {exc}")

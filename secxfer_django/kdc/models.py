@@ -3,7 +3,7 @@ from django.db import models
 
 class UserIdentity(models.Model):
     key_id = models.CharField(max_length=64, unique=True)
-    identity_pubkey = models.CharField(max_length=128)
+    identity_pubkey = models.CharField(max_length=2496)
     registered_at = models.FloatField(default=time.time)
 
 class PreKey(models.Model):
@@ -12,6 +12,7 @@ class PreKey(models.Model):
     prekey_pubkey = models.CharField(max_length=128)
     used = models.BooleanField(default=False)
     reserved = models.BooleanField(default=False)  # True while a sender has fetched but not yet uploaded
+    reserved_at = models.FloatField(null=True, blank=True)  # Unix timestamp of reservation; None if not reserved
 
 class EncryptedFile(models.Model):
     sender_key_id = models.CharField(max_length=64)
@@ -26,3 +27,7 @@ class AuditLog(models.Model):
     previous_hash = models.CharField(max_length=64)
     current_hash = models.CharField(max_length=64)
     timestamp = models.FloatField(default=time.time)
+
+class AuditChainHead(models.Model):
+    """Singleton serialization point for the append-only audit chain."""
+    current_hash = models.CharField(max_length=64, default="GENESIS_HASH")

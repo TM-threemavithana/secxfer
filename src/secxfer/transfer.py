@@ -12,10 +12,10 @@ import time
 import sqlite3
 from pathlib import Path
 import threading
-from typing import BinaryIO, Iterator, AsyncGenerator
+from typing import AsyncGenerator
 import aiofiles
 
-from secxfer.constants import DEFAULT_TTL, CLOCK_SKEW_TOLERANCE
+from secxfer.constants import DEFAULT_TTL, CLOCK_SKEW_TOLERANCE, ED25519_SIG_LEN
 from secxfer.crypto import (
     CHUNK_SIZE,
     AuthenticationError,
@@ -25,6 +25,7 @@ from secxfer.crypto import (
     derive_stream_key,
     generate_ephemeral_keypair,
     kyber_encapsulate,
+    kyber_decapsulate,
     sign_digest,
     verify_digest,
 )
@@ -141,15 +142,13 @@ async def build_file_v2(
     h = hashlib.sha256()
     async with aiofiles.open(file_path, "rb") as f:
         if file_size == 0:
-            enc = pusher.push_final(b'')
+            enc = pusher.push_final(sign_digest(identity.ed25519_seed, h.digest()))
             yield pack_chunk_len(len(enc)) + enc
         else:
             while True:
                 chunk = await f.read(chunk_size)
                 if not chunk:
                     break
-                if len(chunk) < chunk_size:
-                    chunk += b'\x00' * (chunk_size - len(chunk))
                 h.update(chunk)
                 enc = pusher.push(chunk)
                 yield pack_chunk_len(len(enc)) + enc
@@ -165,6 +164,7 @@ def decrypt_file_v2(
     ciphertext: bytes,
     dest_path: Path | str,
     nonce_cache: NonceCache,
+    identity_name: str = "identity",
 ) -> None:
     """Decrypts a downloaded V2 payload."""
     if not ciphertext:
@@ -186,13 +186,13 @@ def decrypt_file_v2(
     
     transcript = preamble.ephemeral_pub + identity.key_id + preamble.prekey_id_bytes
     transcript_hash = hashlib.sha256(transcript).digest()
-    verify_digest(sender_peer.ed25519, transcript_hash, preamble.sig)
+    verify_digest(sender_peer.ed25519, preamble.sig, transcript_hash)
 
-    local_priv = consume_prekey(keystore_dir, identity.key_id, prekey_id_str, identity.x25519_privkey)
-    if local_priv is None:
-        raise PreKeyConsumedError(f"Pre-key {prekey_id_str} not found or already burned.")
+    try:
+        local_priv = consume_prekey(keystore_dir, identity_name, prekey_id_str)
+    except FileNotFoundError as exc:
+        raise PreKeyConsumedError(f"Pre-key {prekey_id_str} not found or already burned.") from exc
 
-    from secxfer.crypto import kyber_decapsulate
     kyber_ss = kyber_decapsulate(identity.kyber_privkey, preamble.kyber_ciphertext)
 
     stream_key = derive_stream_key(local_priv, preamble.ephemeral_pub, preamble.stream_salt, kyber_secret=kyber_ss)
@@ -200,13 +200,19 @@ def decrypt_file_v2(
 
     # Read Metadata
     raw_len = ciphertext[offset : offset + CHUNK_LEN_SIZE]
+    if len(raw_len) != CHUNK_LEN_SIZE:
+        raise TruncationError("Truncated metadata length field")
     offset += CHUNK_LEN_SIZE
     chunk_len = unpack_chunk_len(raw_len)
+    if chunk_len > MAX_CHUNK_SIZE:
+        raise ProtocolError("Metadata chunk exceeds maximum size")
     
     enc_meta = ciphertext[offset : offset + chunk_len]
+    if len(enc_meta) != chunk_len:
+        raise TruncationError("Truncated metadata chunk")
     offset += chunk_len
-    meta_bytes, tag = puller.pull(enc_meta)
-    if tag != SecretstreamPuller.TAG_MESSAGE:
+    meta_bytes, is_final = puller.pull(enc_meta)
+    if is_final:
         raise ProtocolError("Metadata chunk missing TAG_MESSAGE")
         
     meta = MetadataHeader.unpack(meta_bytes)
@@ -216,6 +222,7 @@ def decrypt_file_v2(
     nonce_cache.check_and_insert(preamble.sender_key_id, meta.transfer_nonce, meta.ttl)
 
     dest_path = Path(dest_path)
+    dest_path.mkdir(parents=True, exist_ok=True)
     # A11: Safe filename extraction
     safe_filename = os.path.basename(meta.filename)
     if not safe_filename or safe_filename in ('.', '..'):
@@ -232,31 +239,163 @@ def decrypt_file_v2(
     h = hashlib.sha256()
     bytes_written = 0
 
-    with open(part_file, 'wb') as f:
-        while offset < len(ciphertext):
-            raw_len = ciphertext[offset : offset + CHUNK_LEN_SIZE]
-            offset += CHUNK_LEN_SIZE
-            chunk_len = unpack_chunk_len(raw_len)
+    final_seen = False
+    try:
+        with open(part_file, 'wb') as f:
+            while offset < len(ciphertext):
+                raw_len = ciphertext[offset : offset + CHUNK_LEN_SIZE]
+                offset += CHUNK_LEN_SIZE
+                if len(raw_len) != CHUNK_LEN_SIZE:
+                    raise TruncationError("Truncated chunk length field")
+                chunk_len = unpack_chunk_len(raw_len)
+                if chunk_len > MAX_CHUNK_SIZE:
+                    raise ProtocolError("Ciphertext chunk exceeds maximum size")
             
-            enc_chunk = ciphertext[offset : offset + chunk_len]
-            offset += chunk_len
-            plaintext, tag = puller.pull(enc_chunk)
+                enc_chunk = ciphertext[offset : offset + chunk_len]
+                offset += chunk_len
+                if len(enc_chunk) != chunk_len:
+                    raise TruncationError("Truncated ciphertext chunk")
+                plaintext, is_final = puller.pull(enc_chunk)
             
-            if tag == SecretstreamPuller.TAG_FINAL:
-                if len(plaintext) != 64:
-                    os.remove(part_file)
-                    raise ProtocolError("Trailer chunk does not contain exactly a 64-byte Ed25519 signature.")
-                verify_digest(sender_peer.ed25519, h.digest(), plaintext)
-                break
-            else:
+                if is_final:
+                    if len(plaintext) != ED25519_SIG_LEN:
+                        raise ProtocolError(f"Trailer chunk does not contain exactly a {ED25519_SIG_LEN}-byte Ed25519 signature.")
+                    verify_digest(sender_peer.ed25519, plaintext, h.digest())
+                    final_seen = True
+                    break
                 remaining = meta.file_size - bytes_written
-                if remaining > 0:
-                    to_write = plaintext[:remaining]
-                    f.write(to_write)
-                    h.update(to_write)  # hash the bytes actually written, not zero-padded plaintext
-                    bytes_written += len(to_write)
+                if remaining <= 0 or len(plaintext) > remaining:
+                    raise ProtocolError("Payload contains more data than declared in metadata")
+                f.write(plaintext)
+                h.update(plaintext)
+                bytes_written += len(plaintext)
+        if not final_seen:
+            raise TruncationError("Missing final authenticated trailer")
+        if bytes_written != meta.file_size:
+            raise TruncationError("Payload ended before the declared file size")
+        if offset != len(ciphertext):
+            raise ProtocolError("Trailing data after final authenticated trailer")
+        part_file.replace(out_file)
+    except Exception:
+        if part_file.exists():
+            part_file.unlink()
+        raise
 
-    part_file.replace(out_file)
+
+def _decrypt_v2_stream(
+    identity: LocalIdentity,
+    keystore: Keystore,
+    keystore_dir: Path | str,
+    fh,  # binary file handle — reads sequentially, never loads full payload
+    dest_path: Path | str,
+    nonce_cache: NonceCache,
+    identity_name: str = "identity",
+) -> None:
+    """Internal: true streaming decryption from any binary file handle."""
+    version_byte = fh.read(1)
+    if not version_byte:
+        raise EOFError("Empty payload")
+    version = version_byte[0]
+    if version != PROTOCOL_VERSION_V2:
+        raise VersionError(f"Unsupported protocol version: {version}")
+
+    preamble_bytes = fh.read(PREAMBLE_SIZE_V2)
+    if len(preamble_bytes) < PREAMBLE_SIZE_V2:
+        raise TruncationError("Truncated V2 preamble")
+    preamble = V2Preamble.unpack(preamble_bytes)
+
+    sender_peer = keystore.get(preamble.sender_key_id)
+    prekey_id_str = preamble.prekey_id_bytes.rstrip(b'\x00').decode('ascii')
+
+    transcript = preamble.ephemeral_pub + identity.key_id + preamble.prekey_id_bytes
+    transcript_hash = hashlib.sha256(transcript).digest()
+    verify_digest(sender_peer.ed25519, preamble.sig, transcript_hash)
+
+    try:
+        local_priv = consume_prekey(keystore_dir, identity_name, prekey_id_str)
+    except FileNotFoundError as exc:
+        raise PreKeyConsumedError(f"Pre-key {prekey_id_str} not found or already burned.") from exc
+
+    kyber_ss = kyber_decapsulate(identity.kyber_privkey, preamble.kyber_ciphertext)
+    stream_key = derive_stream_key(local_priv, preamble.ephemeral_pub, preamble.stream_salt, kyber_secret=kyber_ss)
+    puller = SecretstreamPuller(stream_key, preamble.stream_header)
+
+    # Read metadata chunk
+    raw_len = fh.read(CHUNK_LEN_SIZE)
+    if len(raw_len) < CHUNK_LEN_SIZE:
+        raise TruncationError("Truncated metadata length field")
+    meta_len = unpack_chunk_len(raw_len)
+    if meta_len > MAX_CHUNK_SIZE:
+        raise ProtocolError("Metadata chunk exceeds maximum size")
+    enc_meta = fh.read(meta_len)
+    if len(enc_meta) != meta_len:
+        raise TruncationError("Truncated metadata chunk")
+    meta_bytes, is_final = puller.pull(enc_meta)
+    if is_final:
+        raise ProtocolError("Metadata chunk missing TAG_MESSAGE")
+
+    meta = MetadataHeader.unpack(meta_bytes)
+    now = time.time()
+    if now > meta.timestamp + meta.ttl or now < meta.timestamp - CLOCK_SKEW_TOLERANCE:
+        raise TTLError("Transfer TTL expired")
+    nonce_cache.check_and_insert(preamble.sender_key_id, meta.transfer_nonce, meta.ttl)
+
+    dest_path = Path(dest_path)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    safe_filename = os.path.basename(meta.filename)
+    if not safe_filename or safe_filename in ('.', '..'):
+        safe_filename = "unnamed_transfer.bin"
+
+    out_file = dest_path / safe_filename
+    counter = 1
+    while out_file.exists():
+        out_file = dest_path / f"{safe_filename}.{counter}"
+        counter += 1
+
+    part_file = out_file.with_suffix('.part')
+    h = hashlib.sha256()
+    bytes_written = 0
+
+    final_seen = False
+    try:
+        with open(part_file, 'wb') as out_f:
+            while True:
+                raw_len = fh.read(CHUNK_LEN_SIZE)
+                if not raw_len:
+                    break
+                if len(raw_len) < CHUNK_LEN_SIZE:
+                    raise TruncationError("Truncated chunk length field")
+                chunk_len = unpack_chunk_len(raw_len)
+                if chunk_len > MAX_CHUNK_SIZE:
+                    raise ProtocolError("Ciphertext chunk exceeds maximum size")
+                enc_chunk = fh.read(chunk_len)
+                if len(enc_chunk) != chunk_len:
+                    raise TruncationError("Truncated ciphertext chunk")
+                plaintext, is_final = puller.pull(enc_chunk)
+
+                if is_final:
+                    if len(plaintext) != ED25519_SIG_LEN:
+                        raise ProtocolError(f"Trailer must be {ED25519_SIG_LEN}-byte Ed25519 signature.")
+                    verify_digest(sender_peer.ed25519, plaintext, h.digest())
+                    final_seen = True
+                    break
+                remaining = meta.file_size - bytes_written
+                if remaining <= 0 or len(plaintext) > remaining:
+                    raise ProtocolError("Payload contains more data than declared in metadata")
+                out_f.write(plaintext)
+                h.update(plaintext)
+                bytes_written += len(plaintext)
+        if not final_seen:
+            raise TruncationError("Missing final authenticated trailer")
+        if bytes_written != meta.file_size:
+            raise TruncationError("Payload ended before the declared file size")
+        if fh.read(1):
+            raise ProtocolError("Trailing data after final authenticated trailer")
+        part_file.replace(out_file)
+    except Exception:
+        if part_file.exists():
+            part_file.unlink()
+        raise
 
 
 def decrypt_file_v2_from_path(
@@ -268,10 +407,8 @@ def decrypt_file_v2_from_path(
     nonce_cache: NonceCache,
 ) -> None:
     """
-    Non-breaking overload of decrypt_file_v2 that reads ciphertext from a file
-    on disk rather than a raw bytes object in memory.
-    Use this for large files to avoid OOM.
+    Streaming decryption directly from a file on disk.
+    Memory usage is O(chunk_size) regardless of file size — no OOM risk.
     """
-    ciphertext_path = Path(ciphertext_path)
-    ciphertext = ciphertext_path.read_bytes()
-    decrypt_file_v2(identity, keystore, keystore_dir, ciphertext, dest_path, nonce_cache)
+    with open(Path(ciphertext_path), 'rb') as fh:
+        _decrypt_v2_stream(identity, keystore, keystore_dir, fh, dest_path, nonce_cache)
