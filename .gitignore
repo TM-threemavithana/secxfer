@@ -31,6 +31,8 @@ ENV/
 secret.txt
 received.txt
 out.txt
+qr.txt
+tests/test_ux/
 
 # SQLite databases (runtime state — do not commit)
 *.db
