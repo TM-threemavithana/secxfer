@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    env:
+      PYTHONPATH: src
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.python-version }}" = "3.11" ]; then
+            # pyproject.toml defines server extra with Django>=6.0 (which requires Python >=3.12).
+            # For Python 3.11, install dev/ux extras and the FastAPI server dependencies required by test_server.py.
+            pip install -e ".[dev,ux]"
+            pip install fastapi "uvicorn[standard]" sqlalchemy "httpx[socks]" slowapi python-multipart
+          else
+            pip install -e ".[dev,server,ux]"
+          fi
+
+      - name: Run test suites with JUnit XML reporting
+        run: |
+          mkdir -p reports
+          pytest -v --junitxml=reports/junit-${{ matrix.python-version }}.xml
+
+      - name: Upload Test Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: reports/junit-${{ matrix.python-version }}.xml
+          retention-days: 7
