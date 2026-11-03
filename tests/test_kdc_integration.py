@@ -126,6 +126,14 @@ def test_05_identity_pinning(django_kdc, tmp_env):
     ])
     assert exit_code == 0
     assert (tmp_env["alice"] / "bob.pub").exists()
+    pinned_pub = (tmp_env["alice"] / "bob.pub").read_bytes()
+    expected_pub = (tmp_env["bob"] / "bob.pub").read_bytes()
+    assert pinned_pub == expected_pub
+    assert pinned_pub[:32] == bob_ident.x25519_pubkey
+    assert pinned_pub[32:64] == bob_ident.ed25519_pubkey
+    alice_bob_prekeys = list((tmp_env["alice"] / "bob_prekeys").glob("*.pub"))
+    assert len(alice_bob_prekeys) == 1
+    assert len(alice_bob_prekeys[0].read_bytes()) == 32
 
 # 6. Invalid authentication
 def test_06_invalid_authentication(django_kdc, tmp_env):
