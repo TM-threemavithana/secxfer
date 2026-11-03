@@ -51,26 +51,27 @@ flowchart TD
    - **Replay Protection (`transfer.py`):** Persistent SQLite-backed sliding-window nonce tracking and TTL expiration preventing replay attacks.
    - **Client SDK & CLI (`client.py`, `cli.py`):** High-level client interface providing command-line dispatch, identity lifecycle management, and optional Tor SOCKS5 proxy routing.
 2. **Central Key Directory & Relay (`src/secxfer_server/` / `secxfer_django/`):**
-   - **Key Distribution (KDC):** Public identity registry and one-time ephemeral prekey reservation (X3DH pattern) with atomic consumption guards.
+   - **FastAPI Key Directory (`src/secxfer_server/`):** Lightweight key directory service providing `/upload` and `/keys/{key_id}` endpoints with SQLite persistence and rate limiting.
+   - **Django KDC Infrastructure (`secxfer_django/`):** Enterprise key distribution center with Ed25519 proof-of-possession challenge-response authentication, atomic prekey reservation, and SHA-256 append-only hash-chained audit logging (requires Python `>= 3.12`).
    - **Zero-Knowledge Ciphertext Relay:** Accepts and serves encrypted payload streams. The central server has zero access to private keys or unencrypted plaintext.
-   - **Audit Ledger:** Append-only SHA-256 hash-chained event logs for cryptographic auditability.
 3. **User Experience & Management (`secxfer_nextjs/` / `src/secxfer/ui/`):**
-   - **Local Dashboard:** FastAPI/uvicorn-backed local web interface for visual file transfer and identity management.
-   - **Next.js Dashboard:** Client dashboard for viewing transfer activity, pre-key reserves, and contact identity states.
+   - **Local Web UI Dashboard (`src/secxfer/ui/`):** Local browser interface for managing transfers and keys.
+   - **Next.js Console (`secxfer_nextjs/`):** Modern React dashboard for viewing transfer activity, pre-key reserves, and contact identity states.
    - **Out-of-Band QR Verification (`segno`):** Terminal-rendered QR codes encoding public identity fingerprints for side-channel key pinning.
 
 ---
 
 ## Prerequisites & Installation
 
-### Prerequisites
-- **Python**: `>= 3.11` (tested on Python 3.11, 3.12, and 3.13)
-- **C Compiler / libsodium**: Handled automatically via `PyNaCl` binary wheels on standard platforms.
+### Python Version Support & Dependencies
 
-### Installation
+SecXfer supports **Python 3.11, 3.12, and 3.13**. Note the installation guidance below based on your Python runtime:
 
-Clone the repository and install in editable mode:
+> [!NOTE]
+> **Django 6 Python Requirement:** The `[server]` extra includes `Django>=6.0,<7.0`, which officially requires **Python 3.12 or later**. If running on Python 3.11, install `[dev,ux]` and add standalone FastAPI server packages directly.
 
+#### For Python 3.12 or 3.13:
+Install the complete environment including development tools, UX tools, and the full Django 6 server extra:
 ```bash
 # 1. Clone repository
 git clone https://github.com/TM-threemavithana/secxfer.git
@@ -78,71 +79,106 @@ cd secxfer
 
 # 2. Create virtual environment
 python -m venv .venv
-# On Linux/macOS:
-source .venv/bin/activate
-# On Windows:
-.venv\Scripts\activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# 3. Install core dependencies with testing and UX extras
-pip install -e ".[dev,ux]"
-
-# (Optional) Install server dependencies (FastAPI, Django, SQLAlchemy, Uvicorn)
+# 3. Install core with dev, server (Django 6 + FastAPI), and UX extras
+pip install --upgrade pip
 pip install -e ".[dev,server,ux]"
 ```
+
+#### For Python 3.11:
+Install core libraries, development tools, UX tools, and the standalone FastAPI server packages (omitting Django 6):
+```bash
+# 1. Clone and create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# 2. Install core, dev, and UX extras
+pip install --upgrade pip
+pip install -e ".[dev,ux]"
+
+# 3. Install FastAPI key directory server dependencies
+pip install fastapi "uvicorn[standard]" sqlalchemy "httpx[socks]" slowapi python-multipart
+```
+
+---
+
+## Starting the Key Directory Server Locally
+
+SecXfer includes a standalone FastAPI key-directory server (`src/secxfer_server/`) compatible with all supported Python versions (3.11–3.13):
+
+```bash
+uvicorn secxfer_server.main:app --app-dir src --host 127.0.0.1 --port 8000
+```
+
+- **Interactive API Documentation:** Once running, navigate to `http://127.0.0.1:8000/docs` to inspect OpenAPI endpoints (`/upload` and `/keys/{key_id}`).
+- **Django KDC Alternative (Python 3.12+):** To run the full Django KDC backend with hash-chained audit logging:
+  ```bash
+  export DJANGO_SECRET_KEY="your-secure-development-secret-key"
+  python secxfer_django/manage.py migrate
+  python secxfer_django/manage.py runserver 127.0.0.1:8000
+  ```
 
 ---
 
 ## Verified Quickstart
 
-Follow this step-by-step walkthrough to generate identities, inspect fingerprints, and pin peers.
+Follow this step-by-step walkthrough to generate identities, register keys, and pin peer credentials.
 
-### 1. Generate Local Identity Keypairs
-Create an identity directory with an Ed25519 (signing) and X25519 (key exchange) keypair:
+### Step 1: Generate Local Identity Keypairs
+Generate an identity keypair (X25519 encryption key, Ed25519 signing key) and prekeys in dedicated directories for Alice and Bob:
 
 ```bash
+# Generate Alice's identity
 secxfer keygen --dir ./alice_keys --name alice
-```
-*Output:*
-```text
-Generated keypair in /path/to/alice_keys/
-  Private key : alice_keys/alice.key  (keep secret)
-  Public key  : alice_keys/alice.pub  (share with peers)
-  Key ID      : 4f9e1b2c8a...
-```
 
-### 2. Inspect Key Fingerprint
-Display the key ID and hex-encoded public keys:
+# Generate Bob's identity
+secxfer keygen --dir ./bob_keys --name bob
+```
+*Output creates `<name>.key` (private), `<name>.pub` (public), and `<name>_prekeys/` (one-time prekeys).*
+
+### Step 2: Inspect Key Fingerprints
+Display the 8-byte hexadecimal key ID and raw public keys:
 
 ```bash
 secxfer show-id --identity ./alice_keys/alice.key
+secxfer show-id --identity ./bob_keys/bob.key
 ```
 
-### 3. Display Terminal QR Code for Out-of-Band Verification
-Render an ASCII QR code directly in the terminal to verify the identity key out-of-band:
+### Step 3: Out-of-Band Fingerprint Verification (Terminal QR Code)
+Render an ASCII QR code in the terminal to visually verify an identity out-of-band:
 
 ```bash
 secxfer qr show --identity ./alice_keys/alice.key
 ```
 
-### 4. Register Identity with Central Key Server
-Publish the public identity and upload one-time prekeys to a running KDC server:
+### Step 4: Register Identity on the Key Server
+Publish public keys and initial one-time prekeys to the running key server:
 
 ```bash
-secxfer register --identity ./alice_keys/alice.key --server http://127.0.0.1:8000
+secxfer register --identity ./bob_keys/bob.key --server http://127.0.0.1:8000
 ```
 
-### 5. Fetch and Pin a Peer Identity
-Fetch a peer's public identity from the KDC by key ID and pin it into the local keystore:
+### Step 5: Pin Peer Identity (Prerequisites & Command)
+
+> [!IMPORTANT]
+> **Prerequisites for Pinning a Peer Identity:**
+> 1. Bob must have generated their identity keypair and prekeys (`secxfer keygen`).
+> 2. Bob must have uploaded their public keys to the server (`secxfer register`).
+> 3. Bob must share their 8-byte `key_id` with Alice out-of-band (from `secxfer show-id` or QR code).
+
+Once Bob is registered, Alice pins Bob's public identity into her local keystore:
 
 ```bash
-secxfer pin --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys
+secxfer pin --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys/keystore
 ```
+*Alice's keystore now contains Bob's public key (`bob.pub`) and a reserved prekey for forward-secret transfers.*
 
-### 6. Start the Local Web UI Dashboard
-Launch the local web dashboard to manage identities and transfers visually:
+### Step 6: Launch Local Management Dashboard
+Start the local web dashboard for visual key and transfer management:
 
 ```bash
-secxfer ui --port 8085 --identity alice --keystore ./alice_keys
+secxfer ui --port 8085 --identity alice --keystore ./alice_keys/keystore
 ```
 Open `http://localhost:8085` in your browser.
 
@@ -154,10 +190,10 @@ The `secxfer` executable provides subcommands mapped directly to core protocol o
 
 | Command | Arguments | Description |
 |---|---|---|
-| `keygen` | `--dir DIR [--name NAME]` | Generates X25519 and Ed25519 private (`.key`) and public (`.pub`) key files. |
-| `show-id` | `--identity KEY` | Prints the 8-byte key ID and raw public keys for an identity. |
-| `register` | `--identity KEY --server URL [--name NAME] [--keystore DIR]` | Uploads public identity and batches of one-time prekeys to the key server. |
-| `pin` | `--key-id ID --name ALIAS --server URL --keystore DIR [--force]` | Queries server for peer identity, checks against existing pins, and saves to keystore. |
+| `keygen` | `--dir DIR [--name NAME]` | Generates X25519/Ed25519 keypair and one-time prekeys directory. |
+| `show-id` | `--identity KEY` | Prints the 8-byte key ID, X25519 public key, and Ed25519 public key. |
+| `register` | `--identity KEY --server URL [--name NAME] [--keystore DIR]` | Uploads public identity and unused prekeys to the key server. |
+| `pin` | `--key-id ID --name ALIAS --server URL --keystore DIR [--force]` | Queries server for peer identity, validates pins, and saves to keystore. |
 | `qr show` | `--identity KEY` | Generates a terminal-rendered QR code for out-of-band identity verification. |
 | `ui` | `[--port PORT] [--identity NAME] [--keystore DIR] [--tor]` | Starts the local web management dashboard (defaults to port `8085`). |
 
@@ -173,7 +209,7 @@ SecXfer uses `pytest` with `pytest-asyncio` for unit and regression testing:
 # Run all automated test suites
 pytest -v
 
-# Run a specific test suite
+# Run individual test suites
 pytest tests/test_crypto_v1.py -v
 pytest tests/test_server.py -v
 pytest tests/test_v2_regressions.py -v
@@ -182,7 +218,7 @@ pytest tests/test_x3dh_concurrency.py -v
 
 ### Test Suite Coverage
 - **`tests/test_crypto_v1.py`**: Validates deterministic HKDF derivation, secretstream chunk round-tripping, tamper detection (modified ciphertext, wrong keys, chunk reordering, truncation), and Ed25519 signatures.
-- **`tests/test_server.py`**: Verifies FastAPI key registry upload, retrieval, and rate-limiting behavior.
+- **`tests/test_server.py`**: Verifies FastAPI key directory upload, retrieval, and rate-limiting behavior.
 - **`tests/test_v2_regressions.py`**: Guards streaming payload framing, trailer validation, password-encrypted identity serialization, and deniable payload handling.
 - **`tests/test_x3dh_concurrency.py`**: Multi-process concurrency tests asserting atomic, single-consumption guarantees for one-time prekeys under race conditions.
 
