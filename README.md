@@ -50,9 +50,9 @@ flowchart TD
    - **Local Keystore (`keystore.py`):** On-disk storage for private identity keys, one-time pre-keys, and pinned peer public identities.
    - **Replay Protection (`transfer.py`):** Persistent SQLite-backed sliding-window nonce tracking and TTL expiration preventing replay attacks.
    - **Client SDK & CLI (`client.py`, `cli.py`):** High-level client interface providing command-line dispatch, identity lifecycle management, and optional Tor SOCKS5 proxy routing.
-2. **Central Key Directory & Relay (`src/secxfer_server/` / `secxfer_django/`):**
-   - **FastAPI Key Directory (`src/secxfer_server/`):** Lightweight key directory service providing `/upload` and `/keys/{key_id}` endpoints with SQLite persistence and rate limiting.
-   - **Django KDC Infrastructure (`secxfer_django/`):** Enterprise key distribution center with Ed25519 proof-of-possession challenge-response authentication, atomic prekey reservation, and SHA-256 append-only hash-chained audit logging (requires Python `>= 3.12`).
+2. **Central Key Directory & Relay (`secxfer_django/` / `src/secxfer_server/`):**
+   - **Django KDC Infrastructure (`secxfer_django/`):** Enterprise zero-trust key distribution center with Ed25519 proof-of-possession challenge-response authentication (`/challenge`, `/register`), atomic prekey reservation (`/keys/{key_id}`), and SHA-256 append-only hash-chained audit logging (requires Python `>= 3.12`).
+   - **FastAPI Key Directory (`src/secxfer_server/`):** Lightweight standalone key directory service for testing `/upload` bundle operations and unauthenticated `/keys/{key_id}` lookups (does not implement PoP `/challenge` or `/register` endpoints).
    - **Zero-Knowledge Ciphertext Relay:** Accepts and serves encrypted payload streams. The central server has zero access to private keys or unencrypted plaintext.
 3. **User Experience & Management (`secxfer_nextjs/` / `src/secxfer/ui/`):**
    - **Local Web UI Dashboard (`src/secxfer/ui/`):** Local browser interface for managing transfers and keys.
@@ -103,23 +103,28 @@ pip install fastapi "uvicorn[standard]" sqlalchemy "httpx[socks]" slowapi python
 
 ---
 
-## Starting the Key Directory Server Locally
+## Starting the Key Distribution Center (Django KDC)
 
-SecXfer includes a standalone FastAPI key-directory server (`src/secxfer_server/`) compatible with all supported Python versions (3.11–3.13):
+SecXfer provides an enterprise zero-trust Key Distribution Center (KDC) in `secxfer_django/` (requires Python 3.12+). The KDC manages identity registration, Ed25519 proof-of-possession verification, one-time prekey reservation, and SHA-256 append-only hash-chained audit logging:
 
 ```bash
-uvicorn secxfer_server.main:app --app-dir src --host 127.0.0.1 --port 8000
+# 1. Configure environment
+export DJANGO_SECRET_KEY="your-secure-development-secret-key"
+export DJANGO_DEBUG="true"  # Enables local HTTP operation without SSL redirection
+
+# 2. Apply database migrations
+python secxfer_django/manage.py migrate
+
+# 3. Initialize the challenge-cache table (required for proof-of-possession nonces)
+python secxfer_django/manage.py createcachetable
+
+# 4. Start the KDC server on port 8000
+python secxfer_django/manage.py runserver 127.0.0.1:8000 --noreload
 ```
 
-- **Interactive API Documentation:** Once running, navigate to `http://127.0.0.1:8000/docs` to inspect OpenAPI endpoints (`/upload` and `/keys/{key_id}`).
-- **Django KDC Alternative (Python 3.12+):** To run the full zero-trust Django KDC backend with hash-chained audit logging and challenge-response authentication:
-  ```bash
-  export DJANGO_SECRET_KEY="your-secure-development-secret-key"
-  export DJANGO_DEBUG="true"  # Enables local HTTP operation without SSL redirection
-  python secxfer_django/manage.py migrate
-  python secxfer_django/manage.py createcachetable  # Sets up nonce replay-cache table
-  python secxfer_django/manage.py runserver 127.0.0.1:8000 --noreload
-  ```
+> [!NOTE]
+> **Standalone FastAPI Directory Service (`src/secxfer_server/`):**  
+> SecXfer also contains a lightweight standalone FastAPI service (`uvicorn secxfer_server.main:app --app-dir src --port 8000`) for development testing of bulk bundle uploads (`POST /upload`) and unauthenticated key lookups (`GET /keys/{key_id}`). It does **not** implement `/challenge` or `/register` endpoints and does not provide zero-trust proof-of-possession verification. The authenticated CLI workflow below requires the Django KDC.
 
 ---
 
@@ -154,11 +159,15 @@ Render an ASCII QR code in the terminal to visually verify an identity out-of-ba
 secxfer qr show --identity ./alice_keys/alice.key
 ```
 
-### Step 4: Register Identity on the Key Server
-Publish public keys and initial one-time prekeys to the running key server:
+### Step 4: Register Identities on the Key Server
+Publish public keys and initial one-time prekeys to the running Django KDC:
 
 ```bash
+# Register Bob's identity and prekeys
 secxfer register --identity ./bob_keys/bob.key --server http://127.0.0.1:8000
+
+# Register Alice's identity (prerequisite for zero-trust authenticated prekey access)
+secxfer register --identity ./alice_keys/alice.key --server http://127.0.0.1:8000
 ```
 
 ### Step 5: Pin Peer Identity (Prerequisites & Command)
@@ -168,20 +177,20 @@ secxfer register --identity ./bob_keys/bob.key --server http://127.0.0.1:8000
 > 1. Bob must have generated their identity keypair and prekeys (`secxfer keygen`).
 > 2. Bob must have uploaded their public keys to the server (`secxfer register`).
 > 3. Bob must share their 8-byte `key_id` with Alice out-of-band (from `secxfer show-id` or QR code).
-> 4. **When targeting the zero-trust Django KDC:** Alice must also register her identity and provide `--identity ./alice_keys/alice.key` during pinning so the KDC can authenticate her request and prevent prekey exhaustion attacks (supported in PR #5).
+> 4. **Zero-Trust Access Requirement:** The Django KDC requires the caller to prove possession of a registered identity (`--identity ./alice_keys/alice.key`) before dispensing a peer's one-time prekey. This defense prevents Prekey Exhaustion / Denial-of-Service attacks against Bob.
 
-Once Bob is registered:
+Once Bob and Alice are registered on the KDC, Alice pins Bob's public identity:
 
-**Against the FastAPI Key Directory Server:**
-```bash
-secxfer pin --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys/keystore
-```
-
-**Against the Django KDC (Authenticated Pinning):**
 ```bash
 secxfer pin --identity ./alice_keys/alice.key --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys/keystore
 ```
-*Alice's keystore now contains Bob's public key (`bob.pub`) and a reserved prekey for forward-secret transfers.*
+
+- **Output & Saved Key Material:**
+  - `./alice_keys/keystore/bob.pub`: Bob's pinned identity public key (Curve25519 + Ed25519 + ML-KEM).
+  - `./alice_keys/keystore/bob_prekeys/<prekey_id>.pub`: Bob's reserved one-time prekey for forward-secret session establishment.
+- **Negative Authentication & Error Behavior:**
+  - Omitting `--identity` against the zero-trust Django KDC returns HTTP 401 Unauthorized and terminates with CLI exit code `1`.
+  - Querying an unknown or exhausted `key_id` returns HTTP 404 Not Found and terminates with CLI exit code `1`.
 
 ### Step 6: Launch Local Management Dashboard
 Start the local web dashboard for visual key and transfer management:
