@@ -196,27 +196,45 @@ def _cmd_register(args: argparse.Namespace) -> None:
         print(f"Registered successfully! Added {data.get('prekeys_added')} prekeys.")
     except Exception as exc:
         logging.error(f"Registration failed: {exc}")
+        raise ProtocolError(f"Registration failed: {exc}")
 
 
 def _cmd_pin(args: argparse.Namespace) -> None:
     import urllib.request
+    import urllib.error
     import json
     from pathlib import Path
     
+    keystore_dir = Path(args.keystore)
+    keystore_dir.mkdir(parents=True, exist_ok=True)
+
+    headers = {}
+    identity_path = getattr(args, "identity", None)
+    if identity_path:
+        client = _get_client(identity_path, keystore_dir, use_tor=getattr(args, 'tor', False))
+        headers = client._auth_headers("GET", f"/keys/{args.key_id}")
+
     # We fetch by key_id
-    req = urllib.request.Request(args.server.rstrip("/") + "/keys/" + args.key_id)
+    req = urllib.request.Request(args.server.rstrip("/") + "/keys/" + args.key_id, headers=headers)
     try:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            logging.error(f"Authentication required by key server for {args.key_id}. Provide --identity to authenticate.")
+            raise AuthenticationError(f"Authentication required by key server for {args.key_id}.")
+        elif exc.code == 404:
+            logging.error(f"Key not found or prekeys exhausted for {args.key_id}: {exc}")
+            raise ProtocolError(f"Key not found or prekeys exhausted for {args.key_id}: {exc}")
+        else:
+            logging.error(f"Failed to fetch key for {args.key_id}: {exc}")
+            raise ProtocolError(f"Failed to fetch key for {args.key_id}: {exc}")
     except Exception as exc:
         logging.error(f"Failed to fetch key for {args.key_id}: {exc}")
-        return
+        raise ProtocolError(f"Failed to fetch key for {args.key_id}: {exc}")
 
     identity_pubkey_hex = data["identity_pubkey"]
     prekey_data = data.get("prekey")
-    
-    keystore_dir = Path(args.keystore)
-    keystore_dir.mkdir(parents=True, exist_ok=True)
     
     pub_path = keystore_dir / f"{args.name}.pub"
     if pub_path.exists():
@@ -224,7 +242,7 @@ def _cmd_pin(args: argparse.Namespace) -> None:
         if existing_pubkey_hex != identity_pubkey_hex:
             if not args.force:
                 logging.error(f"WARNING: Identity for '{args.name}' has CHANGED! This could be a MITM attack or key rotation. Use --force to overwrite.")
-                return
+                raise ProtocolError(f"Identity for '{args.name}' has CHANGED! Potential MITM attack.")
             else:
                 logging.warning(f"Overwriting identity for '{args.name}' due to --force.")
                 
@@ -309,6 +327,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pin.add_argument("--key-id", required=True, metavar="ID")
     p_pin.add_argument("--name", required=True, metavar="ALIAS", help="local alias to save as")
     p_pin.add_argument("--server", required=True, metavar="URL")
+    p_pin.add_argument("--identity", required=False, metavar="KEY", help="path to your .key file for authenticating with KDC")
     p_pin.add_argument("--force", action="store_true", help="force overwrite if identity changed")
     p_pin.add_argument("--keystore", required=True, metavar="DIR")
     p_pin.set_defaults(func=_cmd_pin)

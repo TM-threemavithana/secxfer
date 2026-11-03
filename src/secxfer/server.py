@@ -46,9 +46,12 @@ def _verify_pop(identity_pubkey_hex: str, nonce_hex: str, signature_hex: str) ->
     """
     try:
         pubkey_bytes = bytes.fromhex(identity_pubkey_hex)
-        if len(pubkey_bytes) != 64:
+        if len(pubkey_bytes) == 64:
+            ed25519_pubkey = pubkey_bytes[32:]   # second 32 bytes are Ed25519
+        elif len(pubkey_bytes) == 1248:
+            ed25519_pubkey = pubkey_bytes[32:64] # V2 hybrid: bytes 32..64 are Ed25519
+        else:
             return False
-        ed25519_pubkey = pubkey_bytes[32:]   # second 32 bytes are Ed25519
         nonce_bytes = bytes.fromhex(nonce_hex)
         sig_bytes = bytes.fromhex(signature_hex)
         VerifyKey(ed25519_pubkey).verify(nonce_bytes, sig_bytes)
