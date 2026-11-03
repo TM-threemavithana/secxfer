@@ -145,7 +145,7 @@ secxfer keygen --dir ./bob_keys --name bob
 *Output creates `<name>.key` (private), `<name>.pub` (public), and `<name>_prekeys/` (one-time prekeys).*
 
 ### Step 2: Inspect Key Fingerprints
-Display the 8-byte hexadecimal key ID and raw public keys:
+Display the 16-byte hexadecimal key ID (32 hexadecimal characters) and raw public keys:
 
 ```bash
 secxfer show-id --identity ./alice_keys/alice.key
@@ -176,7 +176,7 @@ secxfer register --identity ./alice_keys/alice.key --server http://127.0.0.1:800
 > **Prerequisites for Pinning a Peer Identity:**
 > 1. Bob must have generated their identity keypair and prekeys (`secxfer keygen`).
 > 2. Bob must have uploaded their public keys to the server (`secxfer register`).
-> 3. Bob must share their 8-byte `key_id` with Alice out-of-band (from `secxfer show-id` or QR code).
+> 3. Bob must share their 16-byte `key_id` (32 hexadecimal characters) with Alice out-of-band (from `secxfer show-id` or QR code).
 > 4. **Zero-Trust Access Requirement:** The Django KDC requires the caller to prove possession of a registered identity (`--identity ./alice_keys/alice.key`) before dispensing a peer's one-time prekey. This defense prevents Prekey Exhaustion / Denial-of-Service attacks against Bob.
 
 Once Bob and Alice are registered on the KDC, Alice pins Bob's public identity:
@@ -190,7 +190,7 @@ secxfer pin --identity ./alice_keys/alice.key --key-id <BOB_KEY_ID> --name bob -
   - `./alice_keys/keystore/bob_prekeys/<prekey_id>.pub`: Bob's reserved one-time prekey for forward-secret session establishment.
 - **Negative Authentication & Error Behavior:**
   - Omitting `--identity` against the zero-trust Django KDC returns HTTP 401 Unauthorized and terminates with CLI exit code `1`.
-  - Querying an unknown or exhausted `key_id` returns HTTP 404 Not Found and terminates with CLI exit code `1`.
+  - Querying an unknown or missing peer `key_id` returns HTTP 404 Not Found and terminates with CLI exit code `1`.
 
 ### Step 6: Launch Local Management Dashboard
 Start the local web dashboard for visual key and transfer management:
@@ -209,7 +209,7 @@ The `secxfer` executable provides subcommands mapped directly to core protocol o
 | Command | Arguments | Description |
 |---|---|---|
 | `keygen` | `--dir DIR [--name NAME]` | Generates X25519/Ed25519 keypair and one-time prekeys directory. |
-| `show-id` | `--identity KEY` | Prints the 8-byte key ID, X25519 public key, and Ed25519 public key. |
+| `show-id` | `--identity KEY` | Prints the 16-byte key ID (32 hexadecimal characters), X25519 public key, and Ed25519 public key. |
 | `register` | `--identity KEY --server URL [--name NAME] [--keystore DIR]` | Uploads public identity and unused prekeys to the key server. |
 | `pin` | `--key-id ID --name ALIAS --server URL --keystore DIR [--identity KEY] [--force]` | Queries server for peer identity, validates pins, and saves to keystore. Requires `--identity` for authenticated Django KDC access. |
 | `qr show` | `--identity KEY` | Generates a terminal-rendered QR code for out-of-band identity verification. |
@@ -239,6 +239,7 @@ pytest tests/test_x3dh_concurrency.py -v
 - **`tests/test_server.py`**: Verifies FastAPI key directory upload, retrieval, and rate-limiting behavior.
 - **`tests/test_v2_regressions.py`**: Guards streaming payload framing, trailer validation, password-encrypted identity serialization, and deniable payload handling.
 - **`tests/test_x3dh_concurrency.py`**: Multi-process concurrency tests asserting atomic, single-consumption guarantees for one-time prekeys under race conditions.
+- **`tests/test_kdc_integration.py`**: Integration tests verifying Django KDC PoP registration, challenge issuance, authenticated peer-key retrieval, identity pinning, missing-key failure handling, and runtime compatibility.
 
 ### CI Matrix
 Automated continuous integration is executed on every push and pull request to `master` via GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
