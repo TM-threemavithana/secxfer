@@ -10,6 +10,12 @@ import json
 import subprocess
 import shutil
 
+try:
+    import django
+    HAS_DJANGO = True
+except ImportError:
+    HAS_DJANGO = False
+
 from secxfer.keystore import generate_keypair
 from secxfer.client import SecXferClient
 from secxfer.cli import main
@@ -18,6 +24,9 @@ DJANGO_DIR = WORKSPACE / "secxfer_django"
 
 @pytest.fixture(scope="module")
 def django_kdc():
+    if not HAS_DJANGO or sys.version_info < (3, 12):
+        pytest.skip("Django KDC requires Python >= 3.12 and django installed")
+
     port = 8031
     env = os.environ.copy()
     env["PYTHONPATH"] = str(WORKSPACE / "src")
@@ -159,7 +168,7 @@ def test_07_missing_or_exhausted_prekeys(django_kdc, tmp_env):
     assert exit_code == 1
 
 # 8. Failed command exit codes
-def test_08_failed_command_exit_codes(django_kdc, tmp_env):
+def test_08_failed_command_exit_codes(tmp_env):
     # Empty args
     assert main([]) == 1
     # Invalid identity file
@@ -167,6 +176,10 @@ def test_08_failed_command_exit_codes(django_kdc, tmp_env):
     # Register to offline server
     alice_ident = generate_keypair(tmp_env["alice"], name="alice")
     assert main(["register", "--identity", str(tmp_env["alice"] / "alice.key"), "--server", "http://127.0.0.1:59999", "--keystore", str(tmp_env["alice"])]) == 1
+    # Pin with invalid server
+    assert main(["pin", "--key-id", "someid", "--name", "bob", "--server", "http://127.0.0.1:59999", "--keystore", str(tmp_env["alice"])]) == 1
+
+def test_08b_unauthenticated_pin_kdc_fails(django_kdc, tmp_env):
     # Unauthenticated pin against Django KDC returns 1
     bob_ident = generate_keypair(tmp_env["bob"], name="bob")
     assert main(["pin", "--key-id", bob_ident.key_id.hex(), "--name", "bob", "--server", django_kdc, "--keystore", str(tmp_env["alice"])]) == 1
@@ -177,3 +190,6 @@ def test_09_python_version_compatibility():
     if sys.version_info >= (3, 12):
         import django
         assert django.VERSION[0] >= 6
+    else:
+        # On Python 3.11, verify that Django 6 is not expected
+        assert sys.version_info < (3, 12)
