@@ -112,11 +112,13 @@ uvicorn secxfer_server.main:app --app-dir src --host 127.0.0.1 --port 8000
 ```
 
 - **Interactive API Documentation:** Once running, navigate to `http://127.0.0.1:8000/docs` to inspect OpenAPI endpoints (`/upload` and `/keys/{key_id}`).
-- **Django KDC Alternative (Python 3.12+):** To run the full Django KDC backend with hash-chained audit logging:
+- **Django KDC Alternative (Python 3.12+):** To run the full zero-trust Django KDC backend with hash-chained audit logging and challenge-response authentication:
   ```bash
   export DJANGO_SECRET_KEY="your-secure-development-secret-key"
+  export DJANGO_DEBUG="true"  # Enables local HTTP operation without SSL redirection
   python secxfer_django/manage.py migrate
-  python secxfer_django/manage.py runserver 127.0.0.1:8000
+  python secxfer_django/manage.py createcachetable  # Sets up nonce replay-cache table
+  python secxfer_django/manage.py runserver 127.0.0.1:8000 --noreload
   ```
 
 ---
@@ -166,11 +168,18 @@ secxfer register --identity ./bob_keys/bob.key --server http://127.0.0.1:8000
 > 1. Bob must have generated their identity keypair and prekeys (`secxfer keygen`).
 > 2. Bob must have uploaded their public keys to the server (`secxfer register`).
 > 3. Bob must share their 8-byte `key_id` with Alice out-of-band (from `secxfer show-id` or QR code).
+> 4. **When targeting the zero-trust Django KDC:** Alice must also register her identity and provide `--identity ./alice_keys/alice.key` during pinning so the KDC can authenticate her request and prevent prekey exhaustion attacks (supported in PR #5).
 
-Once Bob is registered, Alice pins Bob's public identity into her local keystore:
+Once Bob is registered:
 
+**Against the FastAPI Key Directory Server:**
 ```bash
 secxfer pin --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys/keystore
+```
+
+**Against the Django KDC (Authenticated Pinning):**
+```bash
+secxfer pin --identity ./alice_keys/alice.key --key-id <BOB_KEY_ID> --name bob --server http://127.0.0.1:8000 --keystore ./alice_keys/keystore
 ```
 *Alice's keystore now contains Bob's public key (`bob.pub`) and a reserved prekey for forward-secret transfers.*
 
@@ -193,7 +202,7 @@ The `secxfer` executable provides subcommands mapped directly to core protocol o
 | `keygen` | `--dir DIR [--name NAME]` | Generates X25519/Ed25519 keypair and one-time prekeys directory. |
 | `show-id` | `--identity KEY` | Prints the 8-byte key ID, X25519 public key, and Ed25519 public key. |
 | `register` | `--identity KEY --server URL [--name NAME] [--keystore DIR]` | Uploads public identity and unused prekeys to the key server. |
-| `pin` | `--key-id ID --name ALIAS --server URL --keystore DIR [--force]` | Queries server for peer identity, validates pins, and saves to keystore. |
+| `pin` | `--key-id ID --name ALIAS --server URL --keystore DIR [--identity KEY] [--force]` | Queries server for peer identity, validates pins, and saves to keystore. Requires `--identity` for authenticated Django KDC access. |
 | `qr show` | `--identity KEY` | Generates a terminal-rendered QR code for out-of-band identity verification. |
 | `ui` | `[--port PORT] [--identity NAME] [--keystore DIR] [--tor]` | Starts the local web management dashboard (defaults to port `8085`). |
 
